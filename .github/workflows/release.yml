@@ -15,8 +15,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - run: pip install pyinstaller pynput pyperclip
+          python-version: "3.13"
+      - run: pip install pyinstaller==6.11.1 pynput==1.8.1 pyperclip==1.9.0
       - name: Build n8mouse.exe (terminal) and n8mousew.exe (background, no window)
         shell: pwsh
         run: |
@@ -44,8 +44,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
-          python-version: "3.12"
-      - run: pip install pyinstaller pynput pyperclip
+          python-version: "3.13"
+      - run: pip install pyinstaller==6.11.1 pynput==1.8.1 pyperclip==1.9.0
       - name: Build n8mouse.app (background app, no Dock icon)
         run: |
           pyinstaller --windowed --name n8mouse --osx-bundle-identifier com.n8mouse.app \

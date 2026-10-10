@@ -16,22 +16,25 @@ After setup it starts at login by itself. Manual run:
 
 Host hotkeys:  ScrollLock = back to host    Ctrl+Alt+1..9 = jump to screen N
 """
+import hashlib
 import json
 import os
 import queue
 import secrets
+import select
 import socket
+import ssl
 import subprocess
 import sys
 import threading
 import time
 
-VERSION = "0.3.0"
+VERSION = "0.4.0"
 APP_ID = "com.n8mouse.agent"
 DEFAULT_CONFIG = {
     "role": "",              # host | client, set by setup
     "host_ip": "",           # client: where the host is
-    "secret": "change-me",   # pairing code, same on every machine
+    "secret": "",            # pairing code, created by 'setup host'; same on every machine
     "port": 24800,
     "layout": {},            # empty = auto: host, then clients to the right in connect order
     "mac_ctrl_is_cmd": True, # PC host -> Mac client: Ctrl acts as Cmd, Win key acts as Ctrl
@@ -44,6 +47,10 @@ CLIP_POLL = 0.5
 CLIP_MAX = 1_000_000
 OPP = {"left": "right", "right": "left", "top": "bottom", "bottom": "top"}
 CODE_ALPHABET = "ABCDEFGHJKMNPQRSTUVWXYZ23456789"
+CODE_LEN = 16                # ~80 bits
+MAX_LINE = 8_000_000         # largest single message (bytes)
+MAX_HANDSHAKES = 16          # concurrent unauthenticated connections on the host
+FAIL_LIMIT, FAIL_WINDOW = 5, 60.0   # wrong-code attempts per IP before a cool-down
 
 
 def config_dir():
@@ -78,6 +85,8 @@ def save_config(cfg):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         json.dump(cfg, f, indent=2)
+    if sys.platform != "win32":
+        os.chmod(path, 0o600)                      # holds the pairing code
     return path
 
 
@@ -90,31 +99,79 @@ def norm_code(code):
 
 
 def new_code():
-    raw = "".join(secrets.choice(CODE_ALPHABET) for _ in range(8))
-    return raw[:4] + "-" + raw[4:]
+    return show_code("".join(secrets.choice(CODE_ALPHABET) for _ in range(CODE_LEN)))
 
 
 def show_code(code):
     c = norm_code(code)
-    return c[:4] + "-" + c[4:] if len(c) == 8 else code
+    return "-".join(c[i:i + 4] for i in range(0, len(c), 4))
+
+
+def code_ok(code):
+    c = norm_code(code)
+    return len(c) == CODE_LEN and all(ch in CODE_ALPHABET for ch in c)
+
+
+def clean_name(name):
+    return "".join(ch for ch in str(name) if ch.isalnum() or ch in "-_.")[:64] or "unnamed"
+
+
+# ==========================================================================
+# security: TLS 1.3 with a key derived from the pairing code
+# ==========================================================================
+_PSK_CACHE = {}
+
+
+def require_tls():
+    if sys.version_info < (3, 13) or not getattr(ssl, "HAS_PSK", False):
+        sys.exit("n8Mouse+ needs Python 3.13 or newer (encrypted connections). "
+                 "This is Python %d.%d." % sys.version_info[:2])
+
+
+def psk_for(code):
+    """32-byte key from the pairing code. scrypt makes guessing expensive even
+    for someone who recorded a handshake."""
+    c = norm_code(code)
+    if c not in _PSK_CACHE:
+        _PSK_CACHE[c] = hashlib.scrypt(c.encode(), salt=b"n8mouse-psk-v1",
+                                       n=2 ** 14, r=8, p=1, dklen=32)
+    return _PSK_CACHE[c]
+
+
+def tls_context(server, code):
+    """Both sides must hold the same pairing code or the handshake fails.
+    The code itself never crosses the network; all traffic is encrypted."""
+    psk = psk_for(code)
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER if server else ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE                # authentication is the shared key
+    ctx.minimum_version = ctx.maximum_version = ssl.TLSVersion.TLSv1_3
+    if server:
+        ctx.set_psk_server_callback(lambda identity: psk if identity == "n8mouse" else b"")
+    else:
+        ctx.set_psk_client_callback(lambda hint: ("n8mouse", psk))
+    return ctx
 
 
 # ==========================================================================
 # transport and clipboard (shared)
 # ==========================================================================
 class Link:
-    """Newline-delimited JSON over TCP with a heartbeat. Sends are queued so
-    input hooks never wait on the network."""
+    """Newline-delimited JSON over an encrypted socket, with a heartbeat.
+    Sends are queued so input hooks never wait on the network. One lock
+    serialises TLS reads and writes (an SSL connection is not thread-safe)."""
 
     def __init__(self, sock):
         self.sock = sock
         self.alive = True
         self.q = queue.Queue()
+        self.io = threading.Lock()
+        self.last_rx = time.monotonic()
         try:
             sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         except OSError:
             pass
-        sock.settimeout(DEAD_AFTER)
+        sock.setblocking(False)                        # never hold the lock while waiting
         threading.Thread(target=self._writer, daemon=True).start()
         threading.Thread(target=self._pinger, daemon=True).start()
 
@@ -133,20 +190,46 @@ class Link:
             if msg is None:
                 break
             try:
-                self.sock.sendall((json.dumps(msg, separators=(",", ":")) + "\n").encode())
+                self._send_all((json.dumps(msg, separators=(",", ":")) + "\n").encode())
             except OSError:
                 break
         self.close()
 
+    def _send_all(self, data):
+        view, deadline = memoryview(data), time.monotonic() + 5
+        while view:
+            try:
+                with self.io:
+                    sent = self.sock.send(view)
+                view = view[sent:]
+            except (ssl.SSLWantWriteError, ssl.SSLWantReadError, BlockingIOError):
+                if time.monotonic() > deadline:
+                    raise OSError("send timed out")
+                select.select([], [self.sock], [], 0.05)
+
     def messages(self):
         buf = b""
         while self.alive:
+            if time.monotonic() - self.last_rx > DEAD_AFTER:
+                break                                  # heartbeat lost
+            pending = self.sock.pending() if hasattr(self.sock, "pending") else 0
+            if not pending:
+                try:
+                    ready, _, _ = select.select([self.sock], [], [], 0.5)
+                except (OSError, ValueError):
+                    break
+                if not ready:
+                    continue
             try:
-                chunk = self.sock.recv(65536)
-            except OSError:                     # includes heartbeat timeout
+                with self.io:
+                    chunk = self.sock.recv(65536)
+            except (ssl.SSLWantReadError, ssl.SSLWantWriteError, BlockingIOError):
+                continue                               # TLS housekeeping, no data yet
+            except OSError:
                 break
             if not chunk:
                 break
+            self.last_rx = time.monotonic()
             buf += chunk
             while b"\n" in buf:
                 line, buf = buf.split(b"\n", 1)
@@ -154,8 +237,10 @@ class Link:
                     msg = json.loads(line)
                 except ValueError:
                     continue
-                if msg.get("t") != "ping":
+                if isinstance(msg, dict) and msg.get("t") != "ping":
                     yield msg
+            if len(buf) > MAX_LINE:
+                break                                  # oversized message
         self.close()
 
     def close(self):
@@ -252,30 +337,48 @@ def discover(port, wait=1.5, target="255.255.255.255"):
     return list(found.values())
 
 
+def connect_tls(ip, port, code, timeout=5):
+    """Encrypted, code-authenticated connection to a host. Raises
+    PermissionError if the host does not hold the same pairing code."""
+    raw = socket.create_connection((ip, port), timeout=timeout)
+    try:
+        raw.settimeout(timeout)
+        return tls_context(False, code).wrap_socket(raw)
+    except ssl.SSLError:
+        raw.close()
+        raise PermissionError("pairing code rejected")
+    except OSError:
+        raw.close()
+        raise
+
+
 def probe_host(ip, port, code, name):
     """Check a pairing code against a host. Returns the host's name,
     "" if the host refused the code, or None if it could not be reached."""
     try:
-        sock = socket.create_connection((ip, port), timeout=4)
+        sock = connect_tls(ip, port, code, timeout=4)
+    except PermissionError:
+        return ""
     except OSError:
         return None
     try:
-        sock.settimeout(4)
-        hello = {"t": "hello", "probe": True, "secret": norm_code(code), "name": name,
-                 "os": sys.platform, "version": VERSION}
+        hello = {"t": "hello", "probe": True, "name": name, "os": sys.platform, "version": VERSION}
         sock.sendall((json.dumps(hello) + "\n").encode())
         buf = b""
-        while b"\n" not in buf:
+        while b"\n" not in buf and len(buf) < 65536:
             chunk = sock.recv(4096)
             if not chunk:
-                return ""                              # host closed: code refused
+                return ""
             buf += chunk
         msg = json.loads(buf.split(b"\n", 1)[0])
-        return str(msg.get("host") or "?") if msg.get("t") == "hello" else ""
-    except (OSError, ValueError):
+        return clean_name(msg.get("host") or "?") if msg.get("t") == "hello" else ""
+    except (OSError, ValueError, AttributeError):
         return ""
     finally:
-        sock.close()
+        try:
+            sock.close()
+        except OSError:
+            pass
 
 
 def control_server(port):
@@ -485,6 +588,10 @@ def vk_names():
 def run_host(cfg):
     if sys.platform != "win32":
         sys.exit("the host must be Windows in this version (Mac host is planned)")
+    require_tls()
+    if not code_ok(cfg.get("secret")):
+        sys.exit("no valid pairing code - run: n8mouse setup host")
+    tls = tls_context(True, cfg["secret"])
     import ctypes
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -612,53 +719,94 @@ def run_host(cfg):
 
     threading.Thread(target=clip.watch, args=(lambda: True, on_host_clip), daemon=True).start()
 
-    def serve(sock, addr):
+    gate = threading.BoundedSemaphore(MAX_HANDSHAKES)
+    failures = {}                                    # ip -> [timestamps of bad attempts]
+    fail_lock = threading.Lock()
+
+    def blocked(ip):
+        with fail_lock:
+            recent = [t for t in failures.get(ip, []) if time.monotonic() - t < FAIL_WINDOW]
+            failures[ip] = recent
+            return len(recent) >= FAIL_LIMIT
+
+    def failed(ip):
+        with fail_lock:
+            failures.setdefault(ip, []).append(time.monotonic())
+
+    def handshake(raw, addr):
+        """TLS handshake: proves the peer holds the pairing code. Nothing is
+        read from a peer before this succeeds."""
+        try:
+            raw.settimeout(DEAD_AFTER)
+            return tls.wrap_socket(raw, server_side=True)
+        except (ssl.SSLError, OSError):
+            failed(addr[0])
+            print("rejected %s (wrong pairing code or not n8Mouse+)" % addr[0])
+            try:
+                raw.close()
+            except OSError:
+                pass
+            return None
+        finally:
+            gate.release()
+
+    def serve(raw, addr):
+        sock = handshake(raw, addr)
+        if sock is None:
+            return
         link = Link(sock)
         msgs = link.messages()
         hello = next(msgs, None)
-        if (not hello or hello.get("t") != "hello" or not hello.get("name")
-                or norm_code(hello.get("secret", "")) != norm_code(cfg["secret"])):
-            print("rejected %s (wrong pairing code or not n8Mouse+)" % addr[0])
+        if not hello or hello.get("t") != "hello" or not hello.get("name"):
             link.close()
             return
+        cname = clean_name(hello["name"])
         if hello.get("probe"):                         # pairing check from setup
             link.send(t="hello", host=name, os="win", version=VERSION)
-            print("pairing check OK from %s (%s)" % (hello.get("name"), addr[0]))
+            print("pairing check OK from %s (%s)" % (cname, addr[0]))
             time.sleep(0.5)
             link.close()
             return
-        cname = str(hello["name"])[:64]
-        k = hub.add(cname, link, hello.get("os", "?"))
+        cos = clean_name(hello.get("os", "?"))
+        k = hub.add(cname, link, cos)
         link.send(t="hello", host=name, os="win", version=VERSION)
-        print("+ %s (%s) from %s   screens: %s" % (
-            cname, hello.get("os", "?"), addr[0], " | ".join(hub.screens())))
+        print("+ %s (%s) from %s   screens: %s" % (cname, cos, addr[0], " | ".join(hub.screens())))
         for m in msgs:
-            t = m.get("t")
-            if t == "leave":
-                set_cursor(hub.client_left(k, m.get("edge"), float(m.get("pos", 0.5))))
-            elif t == "clip":
-                text = m.get("text", "")
-                if isinstance(text, str) and text:
-                    clip.set(text)
-                    hub.broadcast(exclude=k, t="clip", text=text)
+            try:
+                t = m.get("t")
+                if t == "leave":
+                    set_cursor(hub.client_left(k, str(m.get("edge")), float(m.get("pos", 0.5))))
+                elif t == "clip":
+                    text = m.get("text", "")
+                    if isinstance(text, str) and text and len(text) <= CLIP_MAX:
+                        clip.set(text)
+                        hub.broadcast(exclude=k, t="clip", text=text)
+            except (TypeError, ValueError):
+                continue                               # malformed message: ignore
         set_cursor(hub.remove(k, link))
         print("- %s" % cname)
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):         # Windows: no port hijacking
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:
+        srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", port))
-    srv.listen(8)
+    srv.listen(16)
     srv.settimeout(1.0)
     threading.Thread(target=discovery_responder, args=(name, port), daemon=True).start()
-    print("n8Mouse+ %s host '%s' on port %s   pairing code %s" % (VERSION, name, port, show_code(cfg["secret"])))
+    print("n8Mouse+ %s host '%s' on port %s (encrypted)" % (VERSION, name, port))
     print("layout: %s" % ("from n8mouse.json" if hub.static else "auto, clients to the right in connect order"))
     print("ScrollLock = back to host   Ctrl+Alt+1..9 = jump to screen N")
     while True:
         try:
-            sock, addr = srv.accept()
+            raw, addr = srv.accept()
         except socket.timeout:
             continue
-        threading.Thread(target=serve, args=(sock, addr), daemon=True).start()
+        if blocked(addr[0]) or not gate.acquire(blocking=False):
+            raw.close()                                # too many bad codes / connections
+            continue
+        threading.Thread(target=serve, args=(raw, addr), daemon=True).start()
 
 
 # ==========================================================================
@@ -716,6 +864,9 @@ def run_client(host, cfg, name=None):
     from pynput.keyboard import Controller as KC, Key
     from pynput.mouse import Button, Controller as MC
 
+    require_tls()
+    if not code_ok(cfg.get("secret")):
+        sys.exit("no valid pairing code - run: n8mouse setup client <CODE>")
     mac = sys.platform == "darwin"
     port = int(cfg["port"])
     control_server(port)
@@ -769,7 +920,11 @@ def run_client(host, cfg, name=None):
         try:
             if not host:
                 raise OSError("host not found yet")
-            sock = socket.create_connection((host, port), timeout=5)
+            sock = connect_tls(host, port, cfg["secret"])
+        except PermissionError:
+            print("host %s refused the pairing code - run: n8mouse setup client <CODE>" % host)
+            time.sleep(15)
+            continue
         except OSError as e:
             failures += 1
             print("cannot reach %s:%s (%s), retrying..." % (host or "host", port, e))
@@ -785,8 +940,7 @@ def run_client(host, cfg, name=None):
             continue
         failures = 0
         link = Link(sock)
-        link.send(t="hello", secret=norm_code(cfg["secret"]), name=name,
-                  os="mac" if mac else sys.platform, version=VERSION)
+        link.send(t="hello", name=name, os="mac" if mac else sys.platform, version=VERSION)
         st = {"active": False, "keys": set(), "btns": set(), "last_leave": 0.0}
         resolve = key_resolver(Key, False)
 
@@ -805,58 +959,61 @@ def run_client(host, cfg, name=None):
             st["btns"].clear()
 
         for msg in link.messages():
-            t = msg.get("t")
-            if t == "hello":
-                swap = mac and msg.get("os") == "win" and bool(cfg.get("mac_ctrl_is_cmd", True))
-                resolve = key_resolver(Key, swap)
-                print("connected to host '%s'%s" % (msg.get("host"), "  (Ctrl -> Cmd)" if swap else ""))
-                threading.Thread(target=clip.watch, daemon=True, args=(
-                    lambda: link.alive, lambda text: link.send(t="clip", text=text))).start()
-            elif t == "enter":
-                st["active"] = True
-                m.position = place(msg.get("edge"), msg.get("pos", 0.5))
-            elif t == "exit":
-                st["active"] = False
-                release_all()
-            elif t == "m" and st["active"]:
-                px, py = m.position
-                tx, ty = px + msg["dx"] * speed, py + msg["dy"] * speed
-                edge = ("left" if tx < left else "right" if tx > right else
-                        "top" if ty < top else "bottom" if ty > bottom else None)
-                if edge and time.monotonic() - st["last_leave"] > 0.25:
-                    st["last_leave"] = time.monotonic()
-                    pos = (py - top) / max(height, 1) if edge in ("left", "right") \
-                        else (px - left) / max(width, 1)
-                    link.send(t="leave", edge=edge, pos=pos)
-                m.position = (max(left, min(right, tx)), max(top, min(bottom, ty)))
-            elif t == "b" and st["active"]:
-                b = buttons.get(msg.get("b"))
-                if b:
-                    if msg.get("down"):
-                        m.press(b)
-                        st["btns"].add(b)
-                    else:
-                        m.release(b)
-                        st["btns"].discard(b)
-            elif t == "w" and st["active"]:
-                scroll(msg.get("dx", 0), msg.get("dy", 0))
-            elif t == "k" and st["active"]:
-                key = resolve(str(msg.get("key", "")))
-                if key is None:
-                    continue
-                try:
-                    if msg.get("down"):
-                        k.press(key)
-                        st["keys"].add(key)
-                    else:
-                        k.release(key)
-                        st["keys"].discard(key)
-                except Exception:
-                    pass
-            elif t == "clip":
-                text = msg.get("text", "")
-                if isinstance(text, str) and text:
-                    clip.set(text)
+            try:
+                t = msg.get("t")
+                if t == "hello":
+                    swap = mac and msg.get("os") == "win" and bool(cfg.get("mac_ctrl_is_cmd", True))
+                    resolve = key_resolver(Key, swap)
+                    print("connected to host '%s'%s" % (msg.get("host"), "  (Ctrl -> Cmd)" if swap else ""))
+                    threading.Thread(target=clip.watch, daemon=True, args=(
+                        lambda: link.alive, lambda text: link.send(t="clip", text=text))).start()
+                elif t == "enter":
+                    st["active"] = True
+                    m.position = place(msg.get("edge"), msg.get("pos", 0.5))
+                elif t == "exit":
+                    st["active"] = False
+                    release_all()
+                elif t == "m" and st["active"]:
+                    px, py = m.position
+                    tx, ty = px + msg["dx"] * speed, py + msg["dy"] * speed
+                    edge = ("left" if tx < left else "right" if tx > right else
+                            "top" if ty < top else "bottom" if ty > bottom else None)
+                    if edge and time.monotonic() - st["last_leave"] > 0.25:
+                        st["last_leave"] = time.monotonic()
+                        pos = (py - top) / max(height, 1) if edge in ("left", "right") \
+                            else (px - left) / max(width, 1)
+                        link.send(t="leave", edge=edge, pos=pos)
+                    m.position = (max(left, min(right, tx)), max(top, min(bottom, ty)))
+                elif t == "b" and st["active"]:
+                    b = buttons.get(msg.get("b"))
+                    if b:
+                        if msg.get("down"):
+                            m.press(b)
+                            st["btns"].add(b)
+                        else:
+                            m.release(b)
+                            st["btns"].discard(b)
+                elif t == "w" and st["active"]:
+                    scroll(msg.get("dx", 0), msg.get("dy", 0))
+                elif t == "k" and st["active"]:
+                    key = resolve(str(msg.get("key", "")))
+                    if key is None:
+                        continue
+                    try:
+                        if msg.get("down"):
+                            k.press(key)
+                            st["keys"].add(key)
+                        else:
+                            k.release(key)
+                            st["keys"].discard(key)
+                    except Exception:
+                        pass
+                elif t == "clip":
+                    text = msg.get("text", "")
+                    if isinstance(text, str) and text and len(text) <= CLIP_MAX:
+                        clip.set(text)
+            except (TypeError, ValueError, KeyError):
+                continue                           # malformed message: ignore
 
         release_all()
         print("disconnected, reconnecting...")
@@ -972,7 +1129,8 @@ def setup_host(cfg):
         sys.exit("the host must be Windows in this version (Mac host is planned)")
     port = int(cfg["port"])
     print("n8Mouse+ %s setup - host '%s'\n" % (VERSION, machine_name()))
-    if len(norm_code(cfg.get("secret", ""))) != 8:
+    require_tls()
+    if not code_ok(cfg.get("secret")):
         cfg["secret"] = new_code()
     cfg["role"] = "host"
     print("  [1/3] settings saved     %s" % save_config(cfg))
@@ -987,9 +1145,10 @@ def setup_host(cfg):
 def setup_client(cfg, code=None, ip=None):
     name, port = machine_name(), int(cfg["port"])
     print("n8Mouse+ %s setup - client '%s'\n" % (VERSION, name))
+    require_tls()
     code = code or input("  Pairing code from the host: ").strip()
-    if not norm_code(code):
-        sys.exit("  no pairing code given")
+    if not code_ok(code):
+        sys.exit("  that is not a pairing code - it looks like XXXX-XXXX-XXXX-XXXX")
     if ip:
         candidates = [(ip, "?", port)]
     else:
