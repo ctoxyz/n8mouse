@@ -1,0 +1,17 @@
+PackageIdentifier: n8dog.n8mouse
+PackageVersion: 0.3.0
+PackageLocale: en-US
+Publisher: n8dog
+PackageName: n8Mouse+
+License: MIT
+LicenseUrl: https://github.com/ctoxyz/n8mouse/blob/main/LICENSE
+PackageUrl: https://github.com/ctoxyz/n8mouse
+ShortDescription: Share one keyboard, mouse and clipboard across your computers over the LAN.
+Tags:
+  - kvm
+  - keyboard
+  - mouse
+  - clipboard
+  - synergy
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

@@ -1,0 +1,94 @@
+# Push a tag like v0.3.0 -> builds Windows + macOS apps and publishes a GitHub Release.
+name: release
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyinstaller pynput pyperclip
+      - name: Build n8mouse.exe (terminal) and n8mousew.exe (background, no window)
+        shell: pwsh
+        run: |
+          $hidden = "--hidden-import", "pynput.keyboard._win32", "--hidden-import", "pynput.mouse._win32"
+          pyinstaller --onefile --console   --name n8mouse  @hidden n8mouse.py
+          pyinstaller --onefile --noconsole --name n8mousew @hidden n8mouse.py
+          dist\n8mouse.exe version
+      # Optional: free code signing for open source via SignPath Foundation (signpath.org).
+      # Add their GitHub action here once the project is approved.
+      - name: Package
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\n8mouse.exe, dist\n8mousew.exe -DestinationPath n8mouse-windows-x64.zip
+          (Get-FileHash n8mouse-windows-x64.zip -Algorithm SHA256).Hash | Out-File -Encoding ascii n8mouse-windows-x64.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: n8mouse-windows-x64.zip*
+
+  macos:
+    runs-on: macos-14
+    env:
+      APPLE_SIGN_ID: ${{ secrets.APPLE_SIGN_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install pyinstaller pynput pyperclip
+      - name: Build n8mouse.app (background app, no Dock icon)
+        run: |
+          pyinstaller --windowed --name n8mouse --osx-bundle-identifier com.n8mouse.app \
+            --hidden-import pynput.keyboard._darwin --hidden-import pynput.mouse._darwin n8mouse.py
+          /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" dist/n8mouse.app/Contents/Info.plist
+          dist/n8mouse.app/Contents/MacOS/n8mouse version
+      # Optional: sign + notarize (Apple Developer ID, $99/yr). Strongly recommended:
+      # unsigned apps are blocked by Gatekeeper and can lose the Accessibility
+      # permission on every update. Secrets: APPLE_SIGN_ID, APPLE_CERT_P12 (base64),
+      # APPLE_CERT_PASSWORD, APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD.
+      - if: env.APPLE_SIGN_ID != ''
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.APPLE_CERT_P12 }}
+          p12-password: ${{ secrets.APPLE_CERT_PASSWORD }}
+      - if: env.APPLE_SIGN_ID != ''
+        name: Sign and notarize
+        run: |
+          codesign --deep --force --options runtime --timestamp \
+            --entitlements packaging/macos/entitlements.plist --sign "$APPLE_SIGN_ID" dist/n8mouse.app
+          ditto -c -k --keepParent dist/n8mouse.app notarize.zip
+          xcrun notarytool submit notarize.zip --wait --apple-id "${{ secrets.APPLE_ID }}" \
+            --team-id "${{ secrets.APPLE_TEAM_ID }}" --password "${{ secrets.APPLE_APP_PASSWORD }}"
+          xcrun stapler staple dist/n8mouse.app
+      - name: Package
+        run: |
+          ditto -c -k --keepParent dist/n8mouse.app n8mouse-macos-arm64.zip
+          shasum -a 256 n8mouse-macos-arm64.zip | cut -d' ' -f1 > n8mouse-macos-arm64.zip.sha256
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: n8mouse-macos-arm64.zip*
+
+  release:
+    needs: [windows, macos]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
