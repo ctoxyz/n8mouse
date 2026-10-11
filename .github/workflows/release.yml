@@ -6,14 +6,14 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   windows:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.13"
       - run: pip install pyinstaller==6.11.1 pynput==1.8.1 pyperclip==1.9.0
@@ -31,7 +31,7 @@ jobs:
         run: |
           Compress-Archive -Path dist\n8mouse.exe, dist\n8mousew.exe -DestinationPath n8mouse-windows-x64.zip
           (Get-FileHash n8mouse-windows-x64.zip -Algorithm SHA256).Hash | Out-File -Encoding ascii n8mouse-windows-x64.zip.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: windows
           path: n8mouse-windows-x64.zip*
@@ -41,8 +41,8 @@ jobs:
     env:
       APPLE_SIGN_ID: ${{ secrets.APPLE_SIGN_ID }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
         with:
           python-version: "3.13"
       - run: pip install pyinstaller==6.11.1 pynput==1.8.1 pyperclip==1.9.0
@@ -51,13 +51,14 @@ jobs:
           pyinstaller --windowed --name n8mouse --osx-bundle-identifier com.n8mouse.app \
             --hidden-import pynput.keyboard._darwin --hidden-import pynput.mouse._darwin n8mouse.py
           /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" dist/n8mouse.app/Contents/Info.plist
+          /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $(sed -n 's/^VERSION = "\(.*\)"/\1/p' n8mouse.py)" dist/n8mouse.app/Contents/Info.plist
           dist/n8mouse.app/Contents/MacOS/n8mouse version
       # Optional: sign + notarize (Apple Developer ID, $99/yr). Strongly recommended:
       # unsigned apps are blocked by Gatekeeper and can lose the Accessibility
       # permission on every update. Secrets: APPLE_SIGN_ID, APPLE_CERT_P12 (base64),
       # APPLE_CERT_PASSWORD, APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD.
       - if: env.APPLE_SIGN_ID != ''
-        uses: apple-actions/import-codesign-certs@v3
+        uses: apple-actions/import-codesign-certs@63fff01cd422d4b7b855d40ca1e9d34d2de9427d # v3.0.0
         with:
           p12-file-base64: ${{ secrets.APPLE_CERT_P12 }}
           p12-password: ${{ secrets.APPLE_CERT_PASSWORD }}
@@ -74,7 +75,7 @@ jobs:
         run: |
           ditto -c -k --keepParent dist/n8mouse.app n8mouse-macos-arm64.zip
           shasum -a 256 n8mouse-macos-arm64.zip | cut -d' ' -f1 > n8mouse-macos-arm64.zip.sha256
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: macos
           path: n8mouse-macos-arm64.zip*
@@ -83,12 +84,14 @@ jobs:
     needs: [windows, macos]
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           path: dist
           merge-multiple: true
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
         with:
           files: dist/*
           generate_release_notes: true

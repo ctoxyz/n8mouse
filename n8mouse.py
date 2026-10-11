@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 
-VERSION = "0.4.0"
+VERSION = "0.4.1"
 APP_ID = "com.n8mouse.agent"
 DEFAULT_CONFIG = {
     "role": "",              # host | client, set by setup
@@ -849,6 +849,11 @@ def key_resolver(Key, swap_ctrl_cmd):
     return resolve
 
 
+def mac_app_name():
+    """Name macOS shows for this program in its permission lists."""
+    return "n8mouse" if getattr(sys, "frozen", False) else "Python"
+
+
 def mac_accessibility_ok(prompt=False):
     try:
         import HIServices
@@ -873,7 +878,7 @@ def run_client(host, cfg, name=None):
     if mac:
         import Quartz
         if not mac_accessibility_ok(prompt=True):
-            print("waiting for permission: System Settings > Privacy & Security > Accessibility > n8Mouse+")
+            print("waiting for permission: System Settings > Privacy & Security > Accessibility > %s" % mac_app_name())
             while not mac_accessibility_ok():
                 time.sleep(2)
             print("Accessibility permission granted")
@@ -928,6 +933,9 @@ def run_client(host, cfg, name=None):
         except OSError as e:
             failures += 1
             print("cannot reach %s:%s (%s), retrying..." % (host or "host", port, e))
+            if mac and failures == 1 and getattr(e, "errno", None) == 65:
+                print("if the host is running, macOS may be blocking this: System Settings > "
+                      "Privacy & Security > Local Network > switch %s on" % mac_app_name())
             if failures % 5 == 0:                     # host moved? look for it again
                 found = find_host()
                 if found and found != host:
@@ -1043,20 +1051,25 @@ def launch_command(background):
 
 
 def win_firewall(add, port):
+    sysdir = os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32")
+    netsh, cmd_exe = os.path.join(sysdir, "netsh.exe"), os.path.join(sysdir, "cmd.exe")
+    if " " in netsh or not os.path.exists(netsh):     # unusual install: fall back to PATH
+        netsh, cmd_exe = "netsh", "cmd.exe"
+
     def present():
-        r = subprocess.run(["netsh", "advfirewall", "firewall", "show", "rule", "name=" + FW_NAME],
+        r = subprocess.run([netsh, "advfirewall", "firewall", "show", "rule", "name=" + FW_NAME],
                            capture_output=True)
         return r.returncode == 0
     if present() == add:
         return "already open" if add else "nothing to remove"
     if add:
-        cmd = ('netsh advfirewall firewall add rule name="{n}" dir=in action=allow protocol=TCP '
-               'localport={p} remoteip=localsubnet & netsh advfirewall firewall add rule name="{n}" '
-               'dir=in action=allow protocol=UDP localport={p} remoteip=localsubnet').format(n=FW_NAME, p=port)
+        cmd = ('{x} advfirewall firewall add rule name="{n}" dir=in action=allow protocol=TCP '
+               'localport={p} remoteip=localsubnet & {x} advfirewall firewall add rule name="{n}" '
+               'dir=in action=allow protocol=UDP localport={p} remoteip=localsubnet').format(x=netsh, n=FW_NAME, p=port)
     else:
-        cmd = 'netsh advfirewall firewall delete rule name="{n}"'.format(n=FW_NAME)
+        cmd = '{x} advfirewall firewall delete rule name="{n}"'.format(x=netsh, n=FW_NAME)
     import ctypes
-    if ctypes.windll.shell32.ShellExecuteW(None, "runas", "cmd.exe", "/c " + cmd, None, 0) <= 32:
+    if ctypes.windll.shell32.ShellExecuteW(None, "runas", cmd_exe, "/c " + cmd, None, 0) <= 32:
         return "skipped (administrator approval declined)"
     for _ in range(30):
         time.sleep(0.5)
@@ -1175,8 +1188,9 @@ def setup_client(cfg, code=None, ip=None):
     print("  [2/3] settings saved     %s" % save_config(cfg))
     print("  [3/3] start at login     %s" % start_background(port))
     if sys.platform == "darwin":
-        print("\n  macOS will ask to let n8Mouse+ control this computer.")
-        print("  Click 'Open System Settings' and switch n8Mouse+ on under Accessibility.")
+        print("\n  macOS will ask for two permissions. Say yes to both:")
+        print("  1. Accessibility: click 'Open System Settings' and switch %s on." % mac_app_name())
+        print("  2. Local Network: click Allow.")
     print("\n  Done. Push the mouse off the host's screen edge to reach this computer.\n")
 
 

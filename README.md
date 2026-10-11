@@ -15,7 +15,7 @@ Download the zip for each computer from the
 
 On the Windows PC that has the keyboard and mouse:
 
-1. Unzip to a folder you will keep, like `C:\n8mouse`.
+1. Unzip to a folder you will keep, inside your own user folder, like `C:\Users\you\n8mouse`.
 2. Right-click inside that folder and choose **Open in Terminal**.
 3. Run:
 
@@ -85,8 +85,12 @@ names, not case sensitive; the reverse side is filled in for you.
 - 16-character pairing codes (~80 bits), stretched with scrypt.
 - Repeated wrong codes from one address are blocked for a minute.
 - The pairing code is stored only in your user settings file (owner-only on macOS).
-- Anyone holding the pairing code can join. Treat it like a Wi-Fi password;
-  to change it, delete `n8mouse.json` on the host, run `n8mouse setup host`, and re-pair each computer.
+- Every paired computer is fully trusted. It can type and click on the others, and it
+  receives everything you copy, passwords included. Only pair computers you own.
+- Anyone holding the pairing code can do the same, so treat it like a password. To change it,
+  delete `n8mouse.json` on the host, run `n8mouse setup host`, and re-pair each computer.
+
+Found a security problem? See [SECURITY.md](SECURITY.md).
 
 ## Limits
 
@@ -94,6 +98,7 @@ names, not case sensitive; the reverse side is filled in for you.
 - Each computer counts as one screen, however many monitors it has.
 - The host must be Windows for now.
 - The Mac download is for Apple Silicon.
+- Made for a home or office network you trust, not public Wi-Fi.
 
 Logs: `n8mouse.log` next to `n8mouse.json`.
 
