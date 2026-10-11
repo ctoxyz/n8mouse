@@ -1,6 +1,7 @@
 # n8Mouse+
 
-One keyboard and mouse for every computer on your desk. Copy on one, paste on any.
+One keyboard and mouse for every computer on your desk. Copy on one, paste on any:
+text, images and files.
 Free and open source (MIT). No accounts, no licence server, no cloud.
 
 ## Install - 3 steps
@@ -60,7 +61,8 @@ The downloads are not code-signed yet, so Windows or macOS may show a warning th
 - Computers line up left to right in the order they connect.
 - **ScrollLock** on the host keyboard: back to the host.
 - **Ctrl+Alt+1..9**: jump straight to screen N.
-- Copy on any computer, paste on any other (text).
+- Copy on any computer, paste on any other: text, an image, or one file (up to 50 MB).
+  Images and files travel when you move the mouse to the other computer.
 
 ## Commands
 
@@ -94,7 +96,7 @@ names, not case sensitive; the reverse side is filled in for you.
 - Repeated wrong codes from one address are blocked for a minute.
 - The pairing code is stored only in your user settings file (owner-only on macOS).
 - Every paired computer is fully trusted. It can type and click on the others, and it
-  receives everything you copy, passwords included. Only pair computers you own.
+  receives everything you copy, passwords, images and files included. Only pair computers you own.
 - Anyone holding the pairing code can do the same, so treat it like a password. To change it,
   delete `n8mouse.json` on the host, run `n8mouse setup host`, and re-pair each computer.
 
@@ -102,7 +104,9 @@ Found a security problem? See [SECURITY.md](SECURITY.md).
 
 ## Limits
 
-- Clipboard is text only.
+- Copy and paste carries text, images, and one file at a time, up to 50 MB
+  (`clip_max_mb` in `n8mouse.json`). For a folder or several files, zip them first.
+- Received files are kept in a `clipboard` folder next to `n8mouse.json` for a day.
 - Each computer counts as one screen, however many monitors it has.
 - The host must be Windows for now.
 - The Mac download is for Apple Silicon.
@@ -118,6 +122,7 @@ Logs: `n8mouse.log` next to `n8mouse.json`.
 - Anyone on the same network can see the host's computer name, even without the code.
 - Another program or user on the same computer can stop n8Mouse+. They cannot control it.
 - The wrong-code lockout has been reviewed in the code but not attack-tested.
+- Image and file paste is new in v0.5 and has been tested on one Windows PC and one Mac.
 - The Mac app is early and unsigned. After an update, macOS may need its Accessibility
   switch turned off and on again.
 - Guessing a pairing code on a 192-core server would take about a trillion years (a rough
@@ -129,7 +134,7 @@ Needs Python 3.13 or newer.
 
 Windows:
 
-    py -m pip install pynput pyperclip
+    py -m pip install pynput pyperclip pillow
     py n8mouse.py setup host
 
 Mac:

@@ -4,12 +4,12 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "n8mouse"
-version = "0.4.2"
+version = "0.5.0"
 description = "Share one keyboard, mouse and clipboard across your computers over the LAN"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.13"
-dependencies = ["pynput>=1.8", "pyperclip>=1.9"]
+dependencies = ["pynput>=1.8", "pyperclip>=1.9", "pillow>=11; sys_platform == 'win32'"]
 keywords = ["kvm", "synergy", "keyboard", "mouse", "clipboard"]
 classifiers = [
   "License :: OSI Approved :: MIT License",

@@ -16,6 +16,7 @@ After setup it starts at login by itself. Manual run:
 
 Host hotkeys:  ScrollLock = back to host    Ctrl+Alt+1..9 = jump to screen N
 """
+import base64
 import hashlib
 import json
 import os
@@ -29,7 +30,7 @@ import sys
 import threading
 import time
 
-VERSION = "0.4.2"
+VERSION = "0.5.0"
 APP_ID = "com.n8mouse.agent"
 DEFAULT_CONFIG = {
     "role": "",              # host | client, set by setup
@@ -40,6 +41,7 @@ DEFAULT_CONFIG = {
     "mac_ctrl_is_cmd": True, # PC host -> Mac client: Ctrl acts as Cmd, Win key acts as Ctrl
     "speed": 1.0,            # client pointer speed multiplier
     "scroll_pixels": 40,     # Mac client: pixels per wheel notch
+    "clip_max_mb": 50,       # largest image or file copy and paste will carry
 }
 PING_EVERY = 2.0
 DEAD_AFTER = 6.0
@@ -277,15 +279,386 @@ class Clip:
                 return
             self.last = text
 
-    def watch(self, alive, on_change):
+    def resync(self):
+        """Forget whatever is on the clipboard now, so it is not sent as new text."""
+        with self.lock:
+            self.last = self._read()
+
+    def watch(self, alive, on_change, rich=None, on_rich=None):
         while alive():
             time.sleep(CLIP_POLL)
+            if rich is not None:
+                try:
+                    changed, item = rich.poll()
+                    if changed and on_rich:
+                        on_rich(item)
+                except Exception as e:
+                    changed, item = False, None
+                    print("clipboard: %s" % e)
+                if item is not None:                   # an image or a file: not text
+                    self.resync()
+                    continue
             with self.lock:
                 cur = self._read()
                 if not cur or cur == self.last or len(cur) > CLIP_MAX:
                     continue
                 self.last = cur
             on_change(cur)
+
+
+# ==========================================================================
+# images and files on the clipboard (v0.5)
+# ==========================================================================
+RICH_CHUNK = 256 * 1024
+WIN_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {"COM%d" % i for i in range(1, 10)} | {"LPT%d" % i for i in range(1, 10)}
+
+
+def safe_name(name):
+    """A bare file name from whatever a peer sent: no folders, no odd characters."""
+    name = str(name or "").replace("\\", "/").split("/")[-1]
+    name = "".join(ch for ch in name if ch.isprintable() and ch not in '<>:"|?*').strip(" .")[:150]
+    if name.split(".")[0].upper() in WIN_RESERVED:
+        name = "_" + name
+    return name or "clipboard-file"
+
+
+def ver_tuple(v):
+    out = []
+    for part in str(v).split(".")[:3]:
+        digits = "".join(ch for ch in part if ch.isdigit())
+        out.append(int(digits) if digits else 0)
+    return tuple(out)
+
+
+def make_blob(kind, name, data):
+    return {"id": secrets.token_hex(8), "kind": kind, "name": safe_name(name), "data": data,
+            "sha": hashlib.sha256(data).hexdigest()}
+
+
+def send_blob(link, blob):
+    """Queue one image or file on a transfer link, in small pieces."""
+    data = blob["data"]
+    link.send(t="bstart", id=blob["id"], kind=blob["kind"], name=blob["name"], size=len(data), sha=blob["sha"])
+    for i in range(0, len(data), RICH_CHUNK):
+        link.send(t="bdata", id=blob["id"], d=base64.b64encode(data[i:i + RICH_CHUNK]).decode("ascii"))
+    link.send(t="bend", id=blob["id"])
+
+
+class BlobRx:
+    """Puts a transfer back together. Refuses anything over the size cap, anything that
+    grows past what was announced, and anything whose checksum does not match."""
+
+    def __init__(self, maxbytes):
+        self.max = maxbytes
+        self.cur = None
+
+    def feed(self, m):
+        t = m.get("t")
+        if t == "bstart":
+            self.cur = None
+            kind, size = m.get("kind"), m.get("size")
+            if kind not in ("image", "file") or not isinstance(size, int) or not 0 < size <= self.max:
+                raise ValueError("kind or size not allowed")
+            self.cur = {"id": str(m.get("id"))[:32], "kind": kind, "name": safe_name(m.get("name")),
+                        "size": size, "sha": str(m.get("sha")), "parts": [], "got": 0}
+        elif t == "bdata" and self.cur and m.get("id") == self.cur["id"]:
+            d = base64.b64decode(str(m.get("d", "")), validate=True)
+            self.cur["got"] += len(d)
+            if self.cur["got"] > self.cur["size"]:
+                self.cur = None
+                raise ValueError("more data than announced")
+            self.cur["parts"].append(d)
+        elif t == "bend" and self.cur and m.get("id") == self.cur["id"]:
+            c, self.cur = self.cur, None
+            data = b"".join(c["parts"])
+            if len(data) != c["size"] or hashlib.sha256(data).hexdigest() != c["sha"]:
+                raise ValueError("size or checksum mismatch")
+            return {"id": c["id"], "kind": c["kind"], "name": c["name"], "data": data, "sha": c["sha"]}
+        return None
+
+
+def dib_to_png(dib):
+    """Windows bitmap (CF_DIB) -> PNG bytes. Needs Pillow; returns None without it."""
+    try:
+        import io
+        from PIL import BmpImagePlugin
+        out = io.BytesIO()
+        BmpImagePlugin.DibImageFile(io.BytesIO(dib)).save(out, "PNG")
+        return out.getvalue()
+    except Exception:
+        return None
+
+
+def png_to_dib(png):
+    """PNG bytes -> Windows bitmap (CF_DIB). Needs Pillow; returns None without it."""
+    try:
+        import io
+        from PIL import Image
+        img = Image.open(io.BytesIO(png))
+        if img.mode not in ("RGB", "RGBA"):
+            img = img.convert("RGBA" if "A" in img.getbands() or "transparency" in img.info else "RGB")
+        if img.mode == "RGBA":                           # most Windows apps ignore alpha in a DIB
+            from PIL import Image as I
+            flat = I.new("RGB", img.size, (255, 255, 255))
+            flat.paste(img, mask=img.split()[3])
+            img = flat
+        out = io.BytesIO()
+        img.save(out, "BMP")
+        return out.getvalue()[14:]                       # drop the 14-byte file header
+    except Exception:
+        return None
+
+
+def pack_dropfiles(path):
+    """CF_HDROP payload for one file path."""
+    import struct
+    return struct.pack("<IiiII", 20, 0, 0, 0, 1) + (path + "\0\0").encode("utf-16-le")
+
+
+class WinRich:
+    """Windows clipboard: images and single files, through ctypes."""
+    CF_DIB, CF_UNICODETEXT, CF_HDROP = 8, 13, 15
+
+    def __init__(self):
+        import ctypes
+        from ctypes import wintypes as w
+        self.c = ctypes
+        self.u, self.k, self.sh = ctypes.windll.user32, ctypes.windll.kernel32, ctypes.windll.shell32
+        u, k, sh, vp = self.u, self.k, self.sh, ctypes.c_void_p
+        u.OpenClipboard.argtypes = [vp]
+        u.GetClipboardData.restype, u.GetClipboardData.argtypes = vp, [w.UINT]
+        u.SetClipboardData.restype, u.SetClipboardData.argtypes = vp, [w.UINT, vp]
+        u.IsClipboardFormatAvailable.argtypes = [w.UINT]
+        u.RegisterClipboardFormatW.restype, u.RegisterClipboardFormatW.argtypes = w.UINT, [ctypes.c_wchar_p]
+        k.GlobalAlloc.restype, k.GlobalAlloc.argtypes = vp, [w.UINT, ctypes.c_size_t]
+        k.GlobalLock.restype, k.GlobalLock.argtypes = vp, [vp]
+        k.GlobalUnlock.argtypes = [vp]
+        k.GlobalFree.argtypes = [vp]
+        k.GlobalSize.restype, k.GlobalSize.argtypes = ctypes.c_size_t, [vp]
+        sh.DragQueryFileW.restype, sh.DragQueryFileW.argtypes = w.UINT, [vp, w.UINT, ctypes.c_wchar_p, w.UINT]
+        self.PNG = u.RegisterClipboardFormatW("PNG")
+        self.DROPEFFECT = u.RegisterClipboardFormatW("Preferred DropEffect")
+
+    def seq(self):
+        return self.u.GetClipboardSequenceNumber()
+
+    def _open(self):
+        for _ in range(10):
+            if self.u.OpenClipboard(None):
+                return True
+            time.sleep(0.03)
+        return False
+
+    def _get(self, fmt):
+        h = self.u.GetClipboardData(fmt)
+        if not h:
+            return None
+        p = self.k.GlobalLock(h)
+        if not p:
+            return None
+        try:
+            return self.c.string_at(p, self.k.GlobalSize(h))
+        finally:
+            self.k.GlobalUnlock(h)
+
+    def _put(self, fmt, data):
+        h = self.k.GlobalAlloc(0x0002, len(data))        # GMEM_MOVEABLE
+        if not h:
+            return
+        p = self.k.GlobalLock(h)
+        self.c.memmove(p, data, len(data))
+        self.k.GlobalUnlock(h)
+        if not self.u.SetClipboardData(fmt, h):
+            self.k.GlobalFree(h)
+
+    def read(self, maxbytes):
+        """('file', path) | ('image', png bytes) | None."""
+        if not self._open():
+            return None
+        path = png = dib = None
+        try:
+            if self.u.IsClipboardFormatAvailable(self.CF_HDROP):
+                h = self.u.GetClipboardData(self.CF_HDROP)
+                if h and self.sh.DragQueryFileW(h, 0xFFFFFFFF, None, 0) == 1:
+                    buf = self.c.create_unicode_buffer(32768)
+                    self.sh.DragQueryFileW(h, 0, buf, 32768)
+                    path = buf.value
+                else:
+                    return None                           # several files or none: not supported
+            elif self.u.IsClipboardFormatAvailable(self.CF_UNICODETEXT):
+                return None                               # text wins (Excel and Word also add a picture)
+            elif self.u.IsClipboardFormatAvailable(self.PNG):
+                png = self._get(self.PNG)
+            elif self.u.IsClipboardFormatAvailable(self.CF_DIB):
+                dib = self._get(self.CF_DIB)
+        finally:
+            self.u.CloseClipboard()
+        if path:
+            return ("file", path)
+        if dib and len(dib) <= 4 * maxbytes:
+            png = dib_to_png(dib)
+        return ("image", png) if png else None
+
+    def write_image(self, png):
+        dib = png_to_dib(png)
+        if not self._open():
+            return
+        try:
+            self.u.EmptyClipboard()
+            self._put(self.PNG, png)
+            if dib:
+                self._put(self.CF_DIB, dib)
+        finally:
+            self.u.CloseClipboard()
+
+    def write_file(self, path):
+        import struct
+        if not self._open():
+            return
+        try:
+            self.u.EmptyClipboard()
+            self._put(self.CF_HDROP, pack_dropfiles(path))
+            self._put(self.DROPEFFECT, struct.pack("<I", 1))   # copy, not move
+        finally:
+            self.u.CloseClipboard()
+
+
+class MacRich:
+    """macOS clipboard: images and single files, through AppKit."""
+
+    def __init__(self):
+        import AppKit
+        import Foundation
+        self.A, self.F = AppKit, Foundation
+
+    def _pb(self):
+        return self.A.NSPasteboard.generalPasteboard()
+
+    def seq(self):
+        return int(self._pb().changeCount())
+
+    def read(self, maxbytes):
+        pb = self._pb()
+        urls = pb.readObjectsForClasses_options_(
+            [self.F.NSURL], {self.A.NSPasteboardURLReadingFileURLsOnlyKey: True})
+        if urls:
+            return ("file", str(urls[0].path())) if len(urls) == 1 else None
+        if pb.stringForType_("public.utf8-plain-text"):
+            return None                                   # text wins
+        d = pb.dataForType_("public.png")
+        if d is None:
+            tiff = pb.dataForType_("public.tiff")
+            if tiff is None or tiff.length() > 4 * maxbytes:
+                return None
+            rep = self.A.NSBitmapImageRep.imageRepWithData_(tiff)
+            d = rep.representationUsingType_properties_(self.A.NSBitmapImageFileTypePNG, {}) if rep else None
+        return ("image", bytes(d)) if d is not None else None
+
+    def write_image(self, png):
+        pb = self._pb()
+        pb.clearContents()
+        pb.setData_forType_(self.F.NSData.dataWithBytes_length_(png, len(png)), "public.png")
+
+    def write_file(self, path):
+        pb = self._pb()
+        pb.clearContents()
+        pb.writeObjects_([self.F.NSURL.fileURLWithPath_(path)])
+
+
+def rich_backend():
+    try:
+        if sys.platform == "win32":
+            return WinRich()
+        if sys.platform == "darwin":
+            return MacRich()
+    except Exception as e:
+        print("image and file paste is off (%s)" % e)
+    return None
+
+
+class RichClip:
+    """Watches this computer's clipboard for an image or a single file, and puts
+    received ones onto it. Everything here fails soft: a clipboard problem must
+    never disturb the keyboard and mouse."""
+
+    def __init__(self, cfg, backend="auto"):
+        try:
+            self.max = int(float(cfg.get("clip_max_mb", 50)) * 1_000_000)
+        except (TypeError, ValueError):
+            self.max = 50_000_000
+        self.b = rich_backend() if backend == "auto" else backend
+        self.lock = threading.Lock()
+        self.dir = os.path.join(config_dir(), "clipboard")
+        self.last = self._seq()
+        try:
+            for f in os.listdir(self.dir):                # received files older than a day
+                p = os.path.join(self.dir, f)
+                if os.path.isfile(p) and time.time() - os.path.getmtime(p) > 86400:
+                    os.remove(p)
+        except OSError:
+            pass
+
+    def _seq(self):
+        try:
+            return self.b.seq() if self.b else None
+        except Exception:
+            return None
+
+    def poll(self):
+        """(changed, blob). blob is None when the clipboard holds something else."""
+        if not self.b:
+            return False, None
+        with self.lock:
+            s = self._seq()
+            if s is None or s == self.last:
+                return False, None
+            self.last = s
+            try:
+                item = self.b.read(self.max)
+                if not item:
+                    return True, None
+                kind, val = item
+                if kind == "file":
+                    if not os.path.isfile(val):
+                        return True, None                 # a folder
+                    size = os.path.getsize(val)
+                    if not 0 < size <= self.max:
+                        print("clipboard: %s is %.0f MB, over the %d MB limit - not sent"
+                              % (os.path.basename(val), size / 1e6, self.max // 1_000_000))
+                        return True, None
+                    with open(val, "rb") as f:
+                        return True, make_blob("file", os.path.basename(val), f.read())
+                if not 0 < len(val) <= self.max:
+                    print("clipboard: image is over the %d MB limit - not sent" % (self.max // 1_000_000))
+                    return True, None
+                return True, make_blob("image", "image.png", val)
+            except Exception as e:
+                print("clipboard: could not read image or file (%s)" % e)
+                return True, None
+
+    def apply(self, blob):
+        """Put a received image or file on this computer's clipboard."""
+        if not self.b:
+            return False
+        with self.lock:
+            try:
+                if blob["kind"] == "image":
+                    self.b.write_image(blob["data"])
+                else:
+                    os.makedirs(self.dir, exist_ok=True)
+                    path = os.path.join(self.dir, safe_name(blob["name"]))
+                    with open(path + ".part", "wb") as f:
+                        f.write(blob["data"])
+                    os.replace(path + ".part", path)
+                    self.b.write_file(path)
+                print("clipboard: received %s (%.1f MB) - ready to paste"
+                      % ("an image" if blob["kind"] == "image" else blob["name"], len(blob["data"]) / 1e6))
+                return True
+            except Exception as e:
+                print("clipboard: could not place image or file (%s)" % e)
+                return False
+            finally:
+                self.last = self._seq()
 
 
 # ==========================================================================
@@ -446,6 +819,7 @@ class Hub:
         self.active = None           # None = host, else client key
         self.place = place_host      # (edge, pos) -> (x, y) on the host screen
         self.park = park_host        # () -> (x, y) where the host cursor waits
+        self.on_switch = None        # called with the new active key (None = host)
         self.static = {}
         for a, sides in (layout or {}).items():
             for edge, b in (sides or {}).items():
@@ -487,6 +861,8 @@ class Hub:
             if prev is not None and prev in self.clients:
                 self.clients[prev]["link"].send(t="exit")
             self.active = tgt
+            if self.on_switch:
+                self.on_switch(tgt)
             if tgt is None:
                 print("<- %s" % self.host)
                 return self.place(edge, pos)
@@ -539,6 +915,8 @@ class Hub:
             del self.clients[k]
             if self.active == k:
                 self.active = None
+                if self.on_switch:
+                    self.on_switch(None)
                 print("<- %s (client dropped)" % self.host)
                 return self.place(None, 0.5)
             return None
@@ -717,7 +1095,49 @@ def run_host(cfg):
     def on_host_clip(text):
         hub.broadcast(t="clip", text=text)
 
-    threading.Thread(target=clip.watch, args=(lambda: True, on_host_clip), daemon=True).start()
+    # images and files: the host keeps the newest one and hands it to whichever
+    # computer the mouse moves to next
+    rich = RichClip(cfg)
+    rlock = threading.Lock()
+    rstate = {"blob": None, "have": set()}
+    xlinks = {}                                      # client key -> transfer link
+    rq = queue.Queue()
+
+    def on_host_rich(item):
+        with rlock:
+            rstate["blob"], rstate["have"] = item, {hub.hk}
+
+    def deliver(target):
+        key = target or hub.hk
+        with rlock:
+            blob = rstate["blob"]
+            if blob is None or key in rstate["have"]:
+                return
+            rstate["have"].add(key)
+        if target is None:
+            rich.apply(blob)
+            clip.resync()
+            return
+        xl = xlinks.get(target)
+        if xl is None or not xl.alive:
+            with rlock:
+                rstate["have"].discard(key)
+            return
+        send_blob(xl, blob)
+        print("clipboard: sent %s to %s" % ("an image" if blob["kind"] == "image" else blob["name"], target))
+
+    def rich_worker():
+        while True:
+            target = rq.get()
+            try:
+                deliver(target)
+            except Exception as e:
+                print("clipboard: %s" % e)
+
+    hub.on_switch = rq.put
+    threading.Thread(target=rich_worker, daemon=True).start()
+    threading.Thread(target=clip.watch, args=(lambda: True, on_host_clip, rich, on_host_rich),
+                     daemon=True).start()
 
     gate = threading.BoundedSemaphore(MAX_HANDSHAKES)
     failures = {}                                    # ip -> [timestamps of bad attempts]
@@ -761,6 +1181,25 @@ def run_host(cfg):
             link.close()
             return
         cname = clean_name(hello["name"])
+        if hello.get("xfer"):                          # second connection: images and files only
+            xk = cname.lower()
+            xlinks[xk] = link
+            rx = BlobRx(rich.max)
+            for m in msgs:
+                try:
+                    blob = rx.feed(m)
+                except (ValueError, TypeError) as e:
+                    print("clipboard: transfer from %s refused (%s)" % (cname, e))
+                    continue
+                if blob:
+                    with rlock:
+                        rstate["blob"], rstate["have"] = blob, {xk}
+                    print("clipboard: got %s from %s" % ("an image" if blob["kind"] == "image" else blob["name"], cname))
+                    if hub.active != xk:               # the mouse already left that computer
+                        rq.put(hub.active)
+            if xlinks.get(xk) is link:
+                del xlinks[xk]
+            return
         if hello.get("probe"):                         # pairing check from setup
             link.send(t="hello", host=name, os="win", version=VERSION)
             print("pairing check OK from %s (%s)" % (cname, addr[0]))
@@ -890,6 +1329,7 @@ def run_client(host, cfg, name=None):
     speed = float(cfg.get("speed", 1.0))
     spx = float(cfg.get("scroll_pixels", 40))
     clip = Clip()
+    rich = RichClip(cfg)
 
     def scroll(dx, dy):
         if mac:
@@ -949,7 +1389,23 @@ def run_client(host, cfg, name=None):
         failures = 0
         link = Link(sock)
         link.send(t="hello", name=name, os="mac" if mac else sys.platform, version=VERSION)
-        st = {"active": False, "keys": set(), "btns": set(), "last_leave": 0.0}
+        st = {"active": False, "keys": set(), "btns": set(), "last_leave": 0.0, "xl": None}
+
+        def xfer_receive(xl):
+            rx = BlobRx(rich.max)
+            for xm in xl.messages():
+                try:
+                    blob = rx.feed(xm)
+                except (ValueError, TypeError) as e:
+                    print("clipboard: transfer refused (%s)" % e)
+                    continue
+                if blob and rich.apply(blob):
+                    clip.resync()
+
+        def send_rich(item):
+            xl = st["xl"]
+            if item is not None and xl is not None and xl.alive:
+                send_blob(xl, item)
         resolve = key_resolver(Key, False)
 
         def release_all():
@@ -973,8 +1429,17 @@ def run_client(host, cfg, name=None):
                     swap = mac and msg.get("os") == "win" and bool(cfg.get("mac_ctrl_is_cmd", True))
                     resolve = key_resolver(Key, swap)
                     print("connected to host '%s'%s" % (msg.get("host"), "  (Ctrl -> Cmd)" if swap else ""))
+                    if ver_tuple(msg.get("version", "0")) >= (0, 5, 0):
+                        try:                           # second connection for images and files
+                            xl = Link(connect_tls(host, port, cfg["secret"]))
+                            xl.send(t="hello", xfer=True, name=name, version=VERSION)
+                            st["xl"] = xl
+                            threading.Thread(target=xfer_receive, args=(xl,), daemon=True).start()
+                        except (OSError, PermissionError) as e:
+                            print("image and file paste is off for now (%s)" % e)
                     threading.Thread(target=clip.watch, daemon=True, args=(
-                        lambda: link.alive, lambda text: link.send(t="clip", text=text))).start()
+                        lambda: link.alive, lambda text: link.send(t="clip", text=text),
+                        rich, send_rich)).start()
                 elif t == "enter":
                     st["active"] = True
                     m.position = place(msg.get("edge"), msg.get("pos", 0.5))
@@ -1024,6 +1489,8 @@ def run_client(host, cfg, name=None):
                 continue                           # malformed message: ignore
 
         release_all()
+        if st["xl"] is not None:
+            st["xl"].close()
         print("disconnected, reconnecting...")
         time.sleep(2)
 

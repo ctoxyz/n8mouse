@@ -182,5 +182,129 @@ check("key stretching makes each guess slow", kdf > 0.01, "%.0f ms per guess" % 
 nasty = m.clean_name("../../etc/passwd; rm -rf / \n\x1b[31m")
 check("hostile computer names cleaned", all(ch.isalnum() or ch in "-_." for ch in nasty), nasty)
 
+# --- image and file transfer (v0.5) ------------------------------------------
+import hashlib
+
+
+class FakeBoard:
+    """Stands in for the Windows / Mac clipboard so the transfer logic runs anywhere."""
+
+    def __init__(self):
+        self.n, self.item, self.wrote = 0, None, None
+
+    def seq(self):
+        return self.n
+
+    def copy(self, item):
+        self.item, self.n = item, self.n + 1
+
+    def read(self, maxbytes):
+        return self.item
+
+    def write_image(self, png):
+        self.wrote, self.n = ("image", png), self.n + 1
+
+    def write_file(self, path):
+        self.wrote, self.n = ("file", path), self.n + 1
+
+
+got_blobs, refused = [], []
+xsrv = socket.socket()
+xsrv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+xsrv.bind(("127.0.0.1", 0))
+xsrv.listen(4)
+xctx = m.tls_context(True, GOOD)
+
+
+def xserve():
+    while True:
+        try:
+            raw, _ = xsrv.accept()
+        except OSError:
+            return
+        def one(raw=raw):
+            lk = m.Link(xctx.wrap_socket(raw, server_side=True))
+            rx = m.BlobRx(3_000_000)
+            for msg in lk.messages():
+                try:
+                    b = rx.feed(msg)
+                except (ValueError, TypeError) as e:
+                    refused.append(str(e))
+                    continue
+                if b:
+                    got_blobs.append(b)
+        threading.Thread(target=one, daemon=True).start()
+
+
+threading.Thread(target=xserve, daemon=True).start()
+xl = m.Link(m.connect_tls("127.0.0.1", xsrv.getsockname()[1], GOOD))
+payload = os.urandom(1_200_000)
+m.send_blob(xl, m.make_blob("file", "report.bin", payload))
+t0 = time.monotonic()
+while not got_blobs and time.monotonic() - t0 < 10:
+    time.sleep(0.05)
+check("file transfer: 1.2 MB arrives intact over the encrypted link",
+      bool(got_blobs) and got_blobs[0]["data"] == payload and got_blobs[0]["name"] == "report.bin")
+
+m.send_blob(xl, m.make_blob("file", "big.bin", b"x" * 3_000_001))
+time.sleep(1.5)
+check("file transfer: over the size limit is refused", len(got_blobs) == 1 and any("not allowed" in r for r in refused))
+
+bad = m.make_blob("image", "image.png", os.urandom(5000))
+bad["sha"] = hashlib.sha256(b"something else").hexdigest()
+m.send_blob(xl, bad)
+time.sleep(0.8)
+check("file transfer: wrong checksum is refused", len(got_blobs) == 1 and any("checksum" in r for r in refused))
+
+xl.send(t="bstart", id="z1", kind="file", name="grow.bin", size=10, sha="0" * 64)
+xl.send(t="bdata", id="z1", d="QUFBQUFBQUFBQUFBQUFBQUFBQUE=")
+time.sleep(0.6)
+check("file transfer: more data than announced is refused", any("more data" in r for r in refused))
+
+xl.send(t="bstart", id="z2", kind="program", name="x.exe", size=10, sha="0" * 64)
+xl.send(t="bstart", id="z3", kind="file", name="x", size="10", sha="0" * 64)
+time.sleep(0.6)
+check("file transfer: unknown kind and non-numeric size are refused", sum("not allowed" in r for r in refused) >= 3)
+xl.close()
+
+names = {n: m.safe_name(n) for n in ("..\\..\\evil.txt", "../../etc/passwd", "C:\\Windows\\system32\\x.dll",
+                                     "a\x00b\n.txt", "CON.txt", "", "...", "ok name (1).png")}
+flat = all("/" not in v and "\\" not in v and v not in ("", ".", "..") and v.isprintable() for v in names.values())
+check("received file names are flattened to a bare safe name", flat and names["..\\..\\evil.txt"] == "evil.txt"
+      and names["CON.txt"] == "_CON.txt" and names["ok name (1).png"] == "ok name (1).png", str(sorted(names.values())))
+
+import tempfile
+tmpd = tempfile.mkdtemp()
+m.config_dir = lambda: tmpd
+board = FakeBoard()
+rc = m.RichClip({"clip_max_mb": 1}, backend=board)
+check("clipboard watcher: nothing new means nothing sent", rc.poll() == (False, None))
+src = os.path.join(tmpd, "doc.txt")
+open(src, "wb").write(b"hello file")
+board.copy(("file", src))
+ch, blob = rc.poll()
+check("clipboard watcher: a copied file is picked up once", ch and blob["data"] == b"hello file" and rc.poll() == (False, None))
+bigf = os.path.join(tmpd, "big.bin")
+open(bigf, "wb").write(b"0" * 1_000_001)
+board.copy(("file", bigf))
+check("clipboard watcher: a file over clip_max_mb is not sent", rc.poll() == (True, None))
+board.copy(None)
+check("clipboard watcher: text or anything else is left to the text path", rc.poll() == (True, None))
+ok = rc.apply(m.make_blob("file", "..\\..\\evil.txt", b"data"))
+landed = board.wrote[1] if board.wrote else ""
+check("received file is saved inside the n8mouse clipboard folder only",
+      ok and os.path.dirname(landed) == os.path.join(tmpd, "clipboard") and os.path.basename(landed) == "evil.txt"
+      and open(landed, "rb").read() == b"data")
+check("a received item is not sent back as if it were a new copy", rc.poll() == (False, None))
+rc.apply(m.make_blob("image", "image.png", b"\x89PNG fake"))
+check("received image is placed on the clipboard", board.wrote == ("image", b"\x89PNG fake"))
+check("no clipboard support (other systems): feature stays off quietly",
+      m.RichClip({}, backend=None).poll() == (False, None) and m.RichClip({}, backend=None).apply(blob) is False)
+check("drop-file payload has the Windows header and a wide, double-null path",
+      m.pack_dropfiles("C:\\a.txt")[:20] == bytes([20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0])
+      and m.pack_dropfiles("C:\\a.txt")[20:] == "C:\\a.txt\0\0".encode("utf-16-le"))
+check("version compare gates the transfer link", m.ver_tuple("0.5.0") >= (0, 5, 0) > m.ver_tuple("0.4.2")
+      and m.ver_tuple("junk") == (0,))
+
 print("\n%d/%d passed" % (sum(results), len(results)))
 sys.exit(0 if all(results) else 1)
