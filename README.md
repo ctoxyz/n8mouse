@@ -34,8 +34,16 @@ On the Windows PC that has the keyboard and mouse:
     xattr -dr com.apple.quarantine /Applications/n8mouse.app
     /Applications/n8mouse.app/Contents/MacOS/n8mouse setup client YOUR-CODE
 
-The first line is needed because the app is not signed yet.
-When macOS asks, allow **Accessibility** and **Local Network**.
+Mac notes:
+
+- Do not double-click the app. macOS will say it is damaged, because it is not signed yet.
+  The first line above fixes that.
+- macOS asks for two permissions: **Accessibility** and **Local Network**. Allow both.
+  It can ask twice, once for Terminal and once for n8mouse.
+- If setup says "no host answered", Local Network was allowed a moment too late.
+  Run the second line again.
+- If the mouse still does not cross, open System Settings > Privacy & Security and
+  switch `n8mouse` on under both Accessibility and Local Network.
 
 ![Step 3 - Move the mouse. Push it off the edge of the screen.](docs/install-step-3.png)
 
@@ -101,6 +109,18 @@ Found a security problem? See [SECURITY.md](SECURITY.md).
 - Made for a home or office network you trust, not public Wi-Fi.
 
 Logs: `n8mouse.log` next to `n8mouse.json`.
+
+## Honest limits
+
+- No professional security audit. It passes this project's own checks (`tests/security_check.py`) only.
+- Built with AI assistance, and tested by one person on one desk.
+- The pairing code is stored as plain text in `n8mouse.json`.
+- Anyone on the same network can see the host's computer name, even without the code.
+- Another program or user on the same computer can stop n8Mouse+. They cannot control it.
+- The wrong-code lockout has been reviewed in the code but not attack-tested.
+- The Mac app is early: unsigned, a generic icon, and its log file can lag behind.
+- Guessing a pairing code on a 192-core server would take about a trillion years (a rough
+  estimate). Reading it off a sticky note takes four seconds. Guard the sticky note.
 
 ## Run from source
 
