@@ -1,5 +1,5 @@
 PackageIdentifier: n8dog.n8mouse
-PackageVersion: 0.4.1
+PackageVersion: 0.4.2
 InstallerType: zip
 NestedInstallerType: portable
 NestedInstallerFiles:
@@ -9,7 +9,7 @@ NestedInstallerFiles:
     PortableCommandAlias: n8mousew
 Installers:
   - Architecture: x64
-    InstallerUrl: https://github.com/ctoxyz/n8mouse/releases/download/v0.4.1/n8mouse-windows-x64.zip
+    InstallerUrl: https://github.com/ctoxyz/n8mouse/releases/download/v0.4.2/n8mouse-windows-x64.zip
     InstallerSha256: REPLACE_WITH_n8mouse-windows-x64.zip.sha256
 ManifestType: installer
 ManifestVersion: 1.6.0

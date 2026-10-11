@@ -118,7 +118,8 @@ Logs: `n8mouse.log` next to `n8mouse.json`.
 - Anyone on the same network can see the host's computer name, even without the code.
 - Another program or user on the same computer can stop n8Mouse+. They cannot control it.
 - The wrong-code lockout has been reviewed in the code but not attack-tested.
-- The Mac app is early: unsigned, a generic icon, and its log file can lag behind.
+- The Mac app is early and unsigned. After an update, macOS may need its Accessibility
+  switch turned off and on again.
 - Guessing a pairing code on a 192-core server would take about a trillion years (a rough
   estimate). Reading it off a sticky note takes four seconds. Guard the sticky note.
 

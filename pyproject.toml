@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "n8mouse"
-version = "0.4.1"
+version = "0.4.2"
 description = "Share one keyboard, mouse and clipboard across your computers over the LAN"
 readme = "README.md"
 license = { text = "MIT" }

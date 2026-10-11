@@ -20,7 +20,7 @@ jobs:
       - name: Build n8mouse.exe (terminal) and n8mousew.exe (background, no window)
         shell: pwsh
         run: |
-          $hidden = "--hidden-import", "pynput.keyboard._win32", "--hidden-import", "pynput.mouse._win32"
+          $hidden = "--hidden-import", "pynput.keyboard._win32", "--hidden-import", "pynput.mouse._win32", "--icon", "packaging\windows\n8mouse.ico"
           pyinstaller --onefile --console   --name n8mouse  @hidden n8mouse.py
           pyinstaller --onefile --noconsole --name n8mousew @hidden n8mouse.py
           dist\n8mouse.exe version
@@ -49,6 +49,7 @@ jobs:
       - name: Build n8mouse.app (background app, no Dock icon)
         run: |
           pyinstaller --windowed --name n8mouse --osx-bundle-identifier com.n8mouse.app \
+            --icon packaging/macos/n8mouse.icns \
             --hidden-import pynput.keyboard._darwin --hidden-import pynput.mouse._darwin n8mouse.py
           /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" dist/n8mouse.app/Contents/Info.plist
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $(sed -n 's/^VERSION = "\(.*\)"/\1/p' n8mouse.py)" dist/n8mouse.app/Contents/Info.plist

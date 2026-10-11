@@ -29,7 +29,7 @@ import sys
 import threading
 import time
 
-VERSION = "0.4.1"
+VERSION = "0.4.2"
 APP_ID = "com.n8mouse.agent"
 DEFAULT_CONFIG = {
     "role": "",              # host | client, set by setup
@@ -1168,8 +1168,12 @@ def setup_client(cfg, code=None, ip=None):
         print("  [1/3] looking for the host on the network...")
         candidates = discover(port)
         if not candidates:
-            sys.exit("        no host answered. Is the host running? You can also give its IP:\n"
-                     "        n8mouse setup client %s <host-ip>" % show_code(code))
+            msg = ("        no host answered. Is the host running? You can also give its IP:\n"
+                   "        n8mouse setup client %s <host-ip>" % show_code(code))
+            if sys.platform == "darwin":
+                msg += ("\n        If macOS just asked about your local network, "
+                        "click Allow and run this again.")
+            sys.exit(msg)
     host_ip = host_name = None
     refused = False
     for cip, _, cport in candidates:
@@ -1228,6 +1232,9 @@ USAGE = """n8Mouse+ %s - one keyboard and mouse for all your computers
 
 
 def main():
+    for stream in (sys.stdout, sys.stderr):           # packaged Mac app ignores PYTHONUNBUFFERED
+        if stream is not None and hasattr(stream, "reconfigure") and not stream.isatty():
+            stream.reconfigure(line_buffering=True)
     if sys.stdout is None:                           # background build: log to a file
         os.makedirs(config_dir(), exist_ok=True)
         log = os.path.join(config_dir(), "n8mouse.log")

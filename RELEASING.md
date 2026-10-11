@@ -24,12 +24,21 @@ A bad release is fixed with a new version number, so finish the checks before yo
 2. Download both zips, confirm the SHA-256 matches the `.sha256` files, and install
    from the zips on one Windows PC and one Mac exactly as the README says.
 
-## Package managers (not published yet)
+## Package managers
 
-- **winget:** put the version and the Windows `.sha256` into `packaging/winget/*.yaml`,
-  then `wingetcreate submit packaging/winget`. After it merges: `winget install n8dog.n8mouse`.
-- **Homebrew:** copy `packaging/homebrew/n8mouse.rb` into a `homebrew-tap` repo under
-  `Casks/`, with the version and the macOS `.sha256`. Then: `brew install --cask ctoxyz/tap/n8mouse`.
-- **PyPI (optional):** `python -m build && twine upload dist/*`.
+After the release is published:
+
+1. `powershell -ExecutionPolicy Bypass -File packaging\update-hashes.ps1`
+   downloads both zips, checks them against their `.sha256` files, and writes the hashes
+   into `packaging/winget/n8dog.n8mouse.installer.yaml` and `packaging/homebrew/n8mouse.rb`.
+   Commit and push those two files to `main`.
+2. **winget:** `winget validate --manifest packaging\winget`, then
+   `wingetcreate submit --token <GitHub token> packaging\winget`. It opens a pull request on
+   microsoft/winget-pkgs. After it merges: `winget install n8dog.n8mouse`.
+   The package ID `n8dog.n8mouse` is permanent once listed.
+3. **Homebrew:** copy `packaging/homebrew/n8mouse.rb` to `Casks/n8mouse.rb` in
+   github.com/ctoxyz/homebrew-tap and push. Then: `brew install --cask ctoxyz/tap/n8mouse`.
+   The cask removes the macOS quarantine flag after install, because the app is unsigned.
+4. **PyPI (optional):** `python -m build && twine upload dist/*`.
 
 Forking? Replace `ctoxyz` with your GitHub user or org everywhere.
