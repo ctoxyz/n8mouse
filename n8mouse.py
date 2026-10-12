@@ -425,9 +425,16 @@ class WinRich:
         import ctypes
         from ctypes import wintypes as w
         self.c = ctypes
-        self.u, self.k, self.sh = ctypes.windll.user32, ctypes.windll.kernel32, ctypes.windll.shell32
+        self.u = ctypes.WinDLL("user32", use_last_error=True)
+        self.k = ctypes.WinDLL("kernel32", use_last_error=True)
+        self.sh = ctypes.WinDLL("shell32", use_last_error=True)
+        self._hwnd = None
         u, k, sh, vp = self.u, self.k, self.sh, ctypes.c_void_p
         u.OpenClipboard.argtypes = [vp]
+        u.CreateWindowExW.restype = vp
+        u.CreateWindowExW.argtypes = [w.DWORD, ctypes.c_wchar_p, ctypes.c_wchar_p, w.DWORD,
+                                      ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, vp, vp, vp, vp]
+        u.DestroyWindow.argtypes = [vp]
         u.GetClipboardData.restype, u.GetClipboardData.argtypes = vp, [w.UINT]
         u.SetClipboardData.restype, u.SetClipboardData.argtypes = vp, [w.UINT, vp]
         u.IsClipboardFormatAvailable.argtypes = [w.UINT]
@@ -444,12 +451,33 @@ class WinRich:
     def seq(self):
         return self.u.GetClipboardSequenceNumber()
 
-    def _open(self):
-        for _ in range(10):
-            if self.u.OpenClipboard(None):
+    def _open(self, own=False):
+        """own=True opens with a window of ours: Windows needs an owner before it
+        reliably accepts new clipboard data."""
+        self._hwnd = self.u.CreateWindowExW(0, "STATIC", None, 0, 0, 0, 0, 0, None, None, None, None) if own else None
+        for _ in range(40):
+            if self.u.OpenClipboard(self._hwnd):
                 return True
             time.sleep(0.03)
+        self._drop()
         return False
+
+    def _drop(self):
+        if self._hwnd:
+            self.u.DestroyWindow(self._hwnd)
+            self._hwnd = None
+
+    def _close(self):
+        self.u.CloseClipboard()
+        self._drop()
+
+    def _begin_write(self):
+        if not self._open(own=True):
+            raise OSError("the Windows clipboard is busy")
+        if not self.u.EmptyClipboard():
+            err = self.c.get_last_error()
+            self._close()
+            raise OSError("could not clear the Windows clipboard (error %d)" % err)
 
     def _get(self, fmt):
         h = self.u.GetClipboardData(fmt)
@@ -466,12 +494,15 @@ class WinRich:
     def _put(self, fmt, data):
         h = self.k.GlobalAlloc(0x0002, len(data))        # GMEM_MOVEABLE
         if not h:
-            return
+            return False
         p = self.k.GlobalLock(h)
         self.c.memmove(p, data, len(data))
         self.k.GlobalUnlock(h)
         if not self.u.SetClipboardData(fmt, h):
+            self._err = self.c.get_last_error()
             self.k.GlobalFree(h)
+            return False
+        return True
 
     def read(self, maxbytes):
         """('file', path) | ('image', png bytes) | None."""
@@ -494,7 +525,7 @@ class WinRich:
             elif self.u.IsClipboardFormatAvailable(self.CF_DIB):
                 dib = self._get(self.CF_DIB)
         finally:
-            self.u.CloseClipboard()
+            self._close()
         if path:
             return ("file", path)
         if dib and len(dib) <= 4 * maxbytes:
@@ -503,15 +534,15 @@ class WinRich:
 
     def write_image(self, png):
         dib = png_to_dib(png)
-        if not self._open():
-            return
+        self._begin_write()
         try:
-            self.u.EmptyClipboard()
-            self._put(self.PNG, png)
+            ok = self._put(self.PNG, png)
             if dib:
-                self._put(self.CF_DIB, dib)
+                ok = self._put(self.CF_DIB, dib) or ok
+            if not ok:
+                raise OSError("Windows refused the image (error %d)" % getattr(self, "_err", 0))
         finally:
-            self.u.CloseClipboard()
+            self._close()
 
     def as_png(self, data):
         """Picture file bytes -> PNG bytes, or None if it is not a picture we can read."""
@@ -531,18 +562,17 @@ class WinRich:
         folders and into picture apps alike."""
         import struct
         dib = png_to_dib(png) if png else None
-        if not self._open():
-            return
+        self._begin_write()
         try:
-            self.u.EmptyClipboard()
-            self._put(self.CF_HDROP, pack_dropfiles(path))
+            if not self._put(self.CF_HDROP, pack_dropfiles(path)):
+                raise OSError("Windows refused the file (error %d)" % getattr(self, "_err", 0))
             self._put(self.DROPEFFECT, struct.pack("<I", 1))   # copy, not move
             if png:
                 self._put(self.PNG, png)
             if dib:
                 self._put(self.CF_DIB, dib)
         finally:
-            self.u.CloseClipboard()
+            self._close()
 
 
 class MacRich:
@@ -692,8 +722,10 @@ class RichClip:
                         self.b.write_file(path, png)
                     else:
                         self.b.write_file(path)
-                print("clipboard: received %s (%.1f MB) - ready to paste"
-                      % ("an image" if blob["kind"] == "image" else blob["name"], len(blob["data"]) / 1e6))
+                changed = self._seq() != self.last
+                print("clipboard: received %s (%.1f MB) - %s"
+                      % ("an image" if blob["kind"] == "image" else blob["name"], len(blob["data"]) / 1e6,
+                         "ready to paste" if changed else "but this computer's clipboard did not change"))
                 return True
             except Exception as e:
                 print("clipboard: could not place image or file (%s)" % e)
