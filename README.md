@@ -87,6 +87,15 @@ names, not case sensitive; the reverse side is filled in for you.
       "macbook": { "right": "laptop1" }
     }
 
+## Why not Mouse Without Borders?
+
+Short answer: it is Windows only. n8Mouse+ also drives a Mac.
+
+![n8Mouse+ compared with Mouse Without Borders: n8Mouse+ works with a Mac, is one readable file and uses TLS 1.3. Mouse Without Borders lets any of up to 4 PCs drive and works on the lock screen.](docs/vs-mouse-without-borders.png)
+
+Mouse Without Borders is the better pick if every computer is Windows and you need
+the lock screen, admin windows, or any PC to be the one that drives.
+
 ## Security
 
 - Every connection is encrypted with TLS 1.3, keyed from the pairing code.
