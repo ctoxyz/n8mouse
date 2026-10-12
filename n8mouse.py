@@ -310,6 +310,8 @@ class Clip:
 # images and files on the clipboard (v0.5)
 # ==========================================================================
 RICH_CHUNK = 256 * 1024
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+IMAGE_EXT = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".webp", ".heic"}
 WIN_RESERVED = {"CON", "PRN", "AUX", "NUL"} | {"COM%d" % i for i in range(1, 10)} | {"LPT%d" % i for i in range(1, 10)}
 
 
@@ -511,14 +513,34 @@ class WinRich:
         finally:
             self.u.CloseClipboard()
 
-    def write_file(self, path):
+    def as_png(self, data):
+        """Picture file bytes -> PNG bytes, or None if it is not a picture we can read."""
+        if data[:8] == PNG_MAGIC:
+            return data
+        try:
+            import io
+            from PIL import Image
+            out = io.BytesIO()
+            Image.open(io.BytesIO(data)).save(out, "PNG")
+            return out.getvalue()
+        except Exception:
+            return None
+
+    def write_file(self, path, png=None):
+        """The file itself, plus its picture when it is one, so it pastes into
+        folders and into picture apps alike."""
         import struct
+        dib = png_to_dib(png) if png else None
         if not self._open():
             return
         try:
             self.u.EmptyClipboard()
             self._put(self.CF_HDROP, pack_dropfiles(path))
             self._put(self.DROPEFFECT, struct.pack("<I", 1))   # copy, not move
+            if png:
+                self._put(self.PNG, png)
+            if dib:
+                self._put(self.CF_DIB, dib)
         finally:
             self.u.CloseClipboard()
 
@@ -559,10 +581,20 @@ class MacRich:
         pb.clearContents()
         pb.setData_forType_(self.F.NSData.dataWithBytes_length_(png, len(png)), "public.png")
 
-    def write_file(self, path):
+    def as_png(self, data):
+        if data[:8] == PNG_MAGIC:
+            return data
+        rep = self.A.NSBitmapImageRep.imageRepWithData_(self.F.NSData.dataWithBytes_length_(data, len(data)))
+        d = rep.representationUsingType_properties_(self.A.NSBitmapImageFileTypePNG, {}) if rep else None
+        return bytes(d) if d is not None else None
+
+    def write_file(self, path, png=None):
         pb = self._pb()
         pb.clearContents()
         pb.writeObjects_([self.F.NSURL.fileURLWithPath_(path)])
+        if png:
+            pb.addTypes_owner_(["public.png"], None)
+            pb.setData_forType_(self.F.NSData.dataWithBytes_length_(png, len(png)), "public.png")
 
 
 def rich_backend():
@@ -650,7 +682,16 @@ class RichClip:
                     with open(path + ".part", "wb") as f:
                         f.write(blob["data"])
                     os.replace(path + ".part", path)
-                    self.b.write_file(path)
+                    png = None
+                    if os.path.splitext(path)[1].lower() in IMAGE_EXT and hasattr(self.b, "as_png"):
+                        try:
+                            png = self.b.as_png(blob["data"])
+                        except Exception:
+                            png = None
+                    if png:                               # a picture file: paste works in apps too
+                        self.b.write_file(path, png)
+                    else:
+                        self.b.write_file(path)
                 print("clipboard: received %s (%.1f MB) - ready to paste"
                       % ("an image" if blob["kind"] == "image" else blob["name"], len(blob["data"]) / 1e6))
                 return True

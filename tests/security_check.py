@@ -298,6 +298,22 @@ check("received file is saved inside the n8mouse clipboard folder only",
 check("a received item is not sent back as if it were a new copy", rc.poll() == (False, None))
 rc.apply(m.make_blob("image", "image.png", b"\x89PNG fake"))
 check("received image is placed on the clipboard", board.wrote == ("image", b"\x89PNG fake"))
+
+
+class PicBoard(FakeBoard):
+    def as_png(self, data):
+        return data if data[:8] == m.PNG_MAGIC else None
+
+    def write_file(self, path, png=None):
+        self.wrote, self.n = ("file", path, png), self.n + 1
+
+
+pic = PicBoard()
+rp = m.RichClip({}, backend=pic)
+rp.apply(m.make_blob("file", "shot.png", m.PNG_MAGIC + b"rest"))
+check("a received picture file is offered as a file and as an image", pic.wrote[0] == "file" and pic.wrote[2] == m.PNG_MAGIC + b"rest")
+rp.apply(m.make_blob("file", "notes.txt", b"plain"))
+check("a received non-picture file is offered as a file only", len(pic.wrote) == 2 or pic.wrote[2] is None)
 check("no clipboard support (other systems): feature stays off quietly",
       m.RichClip({}, backend=None).poll() == (False, None) and m.RichClip({}, backend=None).apply(blob) is False)
 check("drop-file payload has the Windows header and a wide, double-null path",
