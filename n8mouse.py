@@ -31,7 +31,7 @@ import sys
 import threading
 import time
 
-VERSION = "0.5.1"
+VERSION = "0.5.2"
 APP_ID = "com.n8mouse.agent"
 DEFAULT_CONFIG = {
     "role": "",              # host | client, set by setup

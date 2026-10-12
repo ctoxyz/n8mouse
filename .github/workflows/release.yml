@@ -54,10 +54,15 @@ jobs:
           /usr/libexec/PlistBuddy -c "Add :LSUIElement bool true" dist/n8mouse.app/Contents/Info.plist
           /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $(sed -n 's/^VERSION = "\(.*\)"/\1/p' n8mouse.py)" dist/n8mouse.app/Contents/Info.plist
           dist/n8mouse.app/Contents/MacOS/n8mouse version
-      # Optional: sign + notarize (Apple Developer ID, $99/yr). Strongly recommended:
-      # unsigned apps are blocked by Gatekeeper and can lose the Accessibility
-      # permission on every update. Secrets: APPLE_SIGN_ID, APPLE_CERT_P12 (base64),
-      # APPLE_CERT_PASSWORD, APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD.
+      # Sign + notarize with the BillZero, Inc. Developer ID. Unsigned apps are blocked
+      # by Gatekeeper and can lose the Accessibility permission on every update.
+      # Secrets: APPLE_SIGN_ID, APPLE_CERT_P12 (base64), APPLE_CERT_PASSWORD,
+      # NOTARY_KEY_P8 (base64 of the App Store Connect API .p8), NOTARY_KEY_ID, NOTARY_ISSUER.
+      - if: startsWith(github.ref, 'refs/tags/') && env.APPLE_SIGN_ID == ''
+        name: Refuse to release unsigned
+        run: |
+          echo "::error::APPLE_SIGN_ID is not set - a tagged release must be signed and notarized"
+          exit 1
       - if: env.APPLE_SIGN_ID != ''
         uses: apple-actions/import-codesign-certs@63fff01cd422d4b7b855d40ca1e9d34d2de9427d # v3.0.0
         with:
@@ -65,13 +70,34 @@ jobs:
           p12-password: ${{ secrets.APPLE_CERT_PASSWORD }}
       - if: env.APPLE_SIGN_ID != ''
         name: Sign and notarize
+        env:
+          NOTARY_KEY_P8: ${{ secrets.NOTARY_KEY_P8 }}
+          NOTARY_KEY_ID: ${{ secrets.NOTARY_KEY_ID }}
+          NOTARY_ISSUER: ${{ secrets.NOTARY_ISSUER }}
         run: |
+          KEY="$RUNNER_TEMP/notary_key.p8"
+          trap 'rm -f "$KEY"' EXIT
+          echo "$NOTARY_KEY_P8" | base64 --decode > "$KEY"
           codesign --deep --force --options runtime --timestamp \
             --entitlements packaging/macos/entitlements.plist --sign "$APPLE_SIGN_ID" dist/n8mouse.app
           ditto -c -k --keepParent dist/n8mouse.app notarize.zip
-          xcrun notarytool submit notarize.zip --wait --apple-id "${{ secrets.APPLE_ID }}" \
-            --team-id "${{ secrets.APPLE_TEAM_ID }}" --password "${{ secrets.APPLE_APP_PASSWORD }}"
+          xcrun notarytool submit notarize.zip --wait --output-format json \
+            --key "$KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" > notary.json || true
+          cat notary.json
+          SUB_ID=$(python3 -c "import json; print(json.load(open('notary.json')).get('id', ''))" 2>/dev/null || true)
+          STATUS=$(python3 -c "import json; print(json.load(open('notary.json')).get('status', ''))" 2>/dev/null || true)
+          if [ "$STATUS" != "Accepted" ]; then
+            echo "::error::notarization status: ${STATUS:-none}"
+            if [ -n "$SUB_ID" ]; then
+              xcrun notarytool log "$SUB_ID" --key "$KEY" --key-id "$NOTARY_KEY_ID" --issuer "$NOTARY_ISSUER" || true
+            fi
+            exit 1
+          fi
           xcrun stapler staple dist/n8mouse.app
+          codesign --verify --deep --strict --verbose=2 dist/n8mouse.app
+          codesign -dv --verbose=4 dist/n8mouse.app 2>&1 | grep -E '^(Authority|Timestamp|CodeDirectory)'
+          spctl -a -vvv -t exec dist/n8mouse.app
+          xcrun stapler validate dist/n8mouse.app
       - name: Package
         run: |
           ditto -c -k --keepParent dist/n8mouse.app n8mouse-macos-arm64.zip
