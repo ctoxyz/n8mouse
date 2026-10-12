@@ -1147,6 +1147,8 @@ def run_host(cfg):
     def on_host_rich(item):
         with rlock:
             rstate["blob"], rstate["have"] = item, {hub.hk}
+        if item is not None and hub.active is not None:
+            rq.put(hub.active)                       # copied, then crossed before we noticed
 
     def deliver(target):
         key = target or hub.hk
