@@ -1,158 +1,64 @@
-# n8Mouse+
+# amalgan8 mobile (React Native CLI)
 
-One keyboard and mouse for every computer on your desk. Copy on one, paste on any:
-text, images and files.
-Free and open source (MIT). No accounts, no licence server, no cloud.
+The n8dog.com collective brain as a native app. Same terminal aesthetic, same
+`{amalgan8}` wordmark, same per-section accents, every menu item, and a live
+search that hits the production Lambda. Pure React Native, zero extra npm deps.
 
-## Install - 3 steps
+## Drop it into a fresh CLI project
 
-Download the zip for each computer from the
-[latest release](https://github.com/ctoxyz/n8mouse/releases/latest):
+```
+npx @react-native-community/cli init amalgan8mobile
+```
 
-- Windows: `n8mouse-windows-x64.zip`
-- Mac (Apple Silicon): `n8mouse-macos-arm64.zip`
+Then copy these over the scaffold:
 
-![Step 1 - Main PC. Run n8mouse setup host. It shows you a code.](docs/install-step-1.png)
+- `App.js`            -> replace the generated one (delete `App.tsx` if a TS template was made)
+- `src/`              -> the whole folder
+- `assets/fonts/`     -> the four JetBrains Mono `.ttf` files
+- `react-native.config.js`
 
-On the Windows PC that has the keyboard and mouse:
+Link the bundled font (one command), then run:
 
-1. Unzip to a folder you will keep, inside your own user folder, like `C:\Users\you\n8mouse`.
-2. Right-click inside that folder and choose **Open in Terminal**.
-3. Run:
+```
+npx react-native-asset
+npx react-native run-android      # or run-ios
+```
 
-       .\n8mouse setup host
+`npx react-native-asset` copies the fonts into the native projects so the
+terminal face renders. If you skip it, flip `USE_JBM` to `false` at the top of
+`src/theme.js` and it falls back to the platform monospace (Menlo / Roboto Mono).
+Font weight selection (`fontWeight`) maps to the right JetBrains Mono cut on
+React Native 0.71+.
 
-4. Click **Yes** when Windows asks. It shows your pairing code.
+## Layout
 
-![Step 2 - Other computers. Run n8mouse setup client with your code.](docs/install-step-2.png)
+```
+App.js                     header (wordmark + section badge), nav strip, router
+src/theme.js               all colors, fonts, per-section accents — reskin here
+src/api.js                 every backend call (live Lambda Function URL)
+src/ui.js                  wordmark, icons, pills, search bar, nav, scan loader
+src/SearchSection.js       search bar -> scanning loader -> results
+src/results/ResultsView.js YOU / ANSWER / probes / engines / job cards
+src/screens/
+  HomeScreen.js            collective brain: ask/teach + floating questions
+  JobsScreen.js            blue: hero, ATS banner, trending, AI roles
+  RentalsScreen.js         teal: hero, trending rentals, by-type
+  LoveScreen.js            AI companions (live /dating/browse-public)
+  LawScreen.js             ExParteAI legal drafting
+  LabScreen.js             experiments
+  HelpScreen.js            FAQ
+  OntologyScreen.js        SENTINEL deterministic drone ops
+```
 
-**Windows:** unzip, open a terminal in the folder the same way, and run:
+## Endpoints
 
-    .\n8mouse setup client YOUR-CODE
+- `POST /search` `{ query }` powers ask/teach, jobs, and rentals (the brain routes by intent).
+- `GET /dating/browse-public` powers the love screen.
+- law / lab / help / ontology are presentational, matching the site sections.
 
-**Mac:** unzip, drag `n8mouse` into Applications, then run in Terminal:
+Base URL is the Lambda Function URL in `src/api.js` (bypasses the API Gateway
+29s timeout). `setToken()` is wired for a future Bearer token.
 
-    xattr -dr com.apple.quarantine /Applications/n8mouse.app
-    /Applications/n8mouse.app/Contents/MacOS/n8mouse setup client YOUR-CODE
-
-Mac notes:
-
-- Do not double-click the app. macOS will say it is damaged, because it is not signed yet.
-  The first line above fixes that.
-- macOS asks for two permissions: **Accessibility** and **Local Network**. Allow both.
-  It can ask twice, once for Terminal and once for n8mouse.
-- If setup says "no host answered", Local Network was allowed a moment too late.
-  Run the second line again.
-- If the mouse still does not cross, open System Settings > Privacy & Security and
-  switch `n8mouse` on under both Accessibility and Local Network.
-
-![Step 3 - Move the mouse. Push it off the edge of the screen.](docs/install-step-3.png)
-
-That's it. Everything starts at login from now on.
-
-The main PC is found automatically. If your network blocks that, add its IP address
-at the end: `setup client YOUR-CODE 192.168.1.10`
-
-The downloads are not code-signed yet, so Windows or macOS may show a warning the first time.
-
-## Use
-
-- Push the pointer off a screen edge to move to the next computer.
-- Computers line up left to right in the order they connect.
-- **ScrollLock** on the host keyboard: back to the host.
-- **Ctrl+Alt+1..9**: jump straight to screen N.
-- Copy on any computer, paste on any other: text, an image, or one file (up to 50 MB).
-  Images and files travel when you move the mouse to the other computer.
-
-## Commands
-
-| Command | |
-|---|---|
-| `n8mouse setup host` | Once, on the keyboard/mouse PC |
-| `n8mouse setup client <CODE> [ip]` | Once, on every other computer |
-| `n8mouse stop` | Stop until next login |
-| `n8mouse uninstall` | Remove start-at-login and firewall rules |
-| `n8mouse` | Run now in the role chosen at setup |
-
-From the zip, type `.\n8mouse` (Windows) or
-`/Applications/n8mouse.app/Contents/MacOS/n8mouse` (Mac) in place of `n8mouse`.
-
-## Custom layout
-
-Edit `"layout"` in the host's `n8mouse.json` (path shown by setup). Names are computer
-names, not case sensitive; the reverse side is filled in for you.
-
-    "layout": {
-      "DESKTOP":  { "right": "macbook", "top": "laptop2" },
-      "macbook": { "right": "laptop1" }
-    }
-
-## Why not Mouse Without Borders?
-
-Short answer: it is Windows only. n8Mouse+ also drives a Mac.
-
-![n8Mouse+ compared with Mouse Without Borders: n8Mouse+ works with a Mac, is one readable file and uses TLS 1.3. Mouse Without Borders lets any of up to 4 PCs drive and works on the lock screen.](docs/vs-mouse-without-borders.png)
-
-Mouse Without Borders is the better pick if every computer is Windows and you need
-the lock screen, admin windows, or any PC to be the one that drives.
-
-## Security
-
-- Every connection is encrypted with TLS 1.3, keyed from the pairing code.
-- Both sides prove they hold the code during the handshake; the code itself never crosses the network.
-  A device that does not have it cannot connect, cannot read traffic, and cannot pose as the host.
-- 16-character pairing codes (~80 bits), stretched with scrypt.
-- Repeated wrong codes from one address are blocked for a minute.
-- The pairing code is stored only in your user settings file (owner-only on macOS).
-- Every paired computer is fully trusted. It can type and click on the others, and it
-  receives everything you copy, passwords, images and files included. Only pair computers you own.
-- Anyone holding the pairing code can do the same, so treat it like a password. To change it,
-  delete `n8mouse.json` on the host, run `n8mouse setup host`, and re-pair each computer.
-
-Found a security problem? See [SECURITY.md](SECURITY.md).
-
-## Limits
-
-- Copy and paste carries text, images, and one file at a time, up to 50 MB
-  (`clip_max_mb` in `n8mouse.json`). For a folder or several files, zip them first.
-- Received files are kept in a `clipboard` folder next to `n8mouse.json`: the newest few, for up to a day.
-- Each computer counts as one screen, however many monitors it has.
-- The host must be Windows for now.
-- The Mac download is for Apple Silicon.
-- Made for a home or office network you trust, not public Wi-Fi.
-
-Logs: `n8mouse.log` next to `n8mouse.json`.
-
-## Honest limits
-
-- No professional security audit. It passes this project's own checks (`tests/security_check.py`) only.
-- Built with AI assistance, and tested by one person on one desk.
-- The pairing code is stored as plain text in `n8mouse.json`.
-- Anyone on the same network can see the host's computer name, even without the code.
-- Another program or user on the same computer can stop n8Mouse+. They cannot control it.
-- The wrong-code lockout has been reviewed in the code but not attack-tested.
-- Image and file paste is new in v0.5 and has been tested on one Windows PC and one Mac.
-- Some apps keep their own clipboard and miss a new picture (Photoshop does). Click another
-  window, click back, then paste.
-- The Mac app is early and unsigned. After an update, macOS may need its Accessibility
-  switch turned off and on again.
-- Guessing a pairing code on a 192-core server would take about a trillion years (a rough
-  estimate). Reading it off a sticky note takes four seconds. Guard the sticky note.
-
-## Run from source
-
-Needs Python 3.13 or newer.
-
-Windows:
-
-    py -m pip install pynput pyperclip pillow
-    py n8mouse.py setup host
-
-Mac:
-
-    brew install python@3.13
-    python3.13 -m venv .venv
-    .venv/bin/pip install pynput pyperclip
-    .venv/bin/python n8mouse.py setup client YOUR-CODE
-
-On a Mac the permission prompts will name Python.
+Results render defensively — they read whatever keys the brain returns
+(`rich_results` / `jobs` / `engines` / `probes` / salary / source / url), so the
+UI holds up as the payload shape evolves.
