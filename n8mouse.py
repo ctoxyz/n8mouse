@@ -23,6 +23,7 @@ import os
 import queue
 import secrets
 import select
+import shutil
 import socket
 import ssl
 import subprocess
@@ -212,15 +213,18 @@ class Link:
     def messages(self):
         buf = b""
         while self.alive:
-            if time.monotonic() - self.last_rx > DEAD_AFTER:
-                break                                  # heartbeat lost
-            pending = self.sock.pending() if hasattr(self.sock, "pending") else 0
+            try:
+                pending = self.sock.pending() if hasattr(self.sock, "pending") else 0
+            except (OSError, ValueError):
+                break
             if not pending:
                 try:
                     ready, _, _ = select.select([self.sock], [], [], 0.5)
                 except (OSError, ValueError):
                     break
                 if not ready:
+                    if time.monotonic() - self.last_rx > DEAD_AFTER:
+                        break                          # heartbeat lost
                     continue
             try:
                 with self.io:
@@ -263,6 +267,7 @@ class Clip:
         import pyperclip
         self.pc = pyperclip
         self.lock = threading.Lock()
+        self.rich = None                 # the image and file watcher, when there is one
         self.last = self._read()
 
     def _read(self):
@@ -278,31 +283,38 @@ class Clip:
             except Exception:
                 return
             self.last = text
+        if self.rich is not None:
+            self.rich.took_text()
+
+    def unsent(self):
+        """True when the clipboard holds text that has not been sent yet."""
+        with self.lock:
+            cur = self._read()
+            return bool(cur) and cur != self.last and len(cur) <= CLIP_MAX
 
     def resync(self):
         """Forget whatever is on the clipboard now, so it is not sent as new text."""
         with self.lock:
             self.last = self._read()
 
-    def watch(self, alive, on_change, rich=None, on_rich=None):
+    def watch(self, alive, on_change, rich=None):
         while alive():
             time.sleep(CLIP_POLL)
             if rich is not None:
                 try:
-                    changed, item = rich.poll()
-                    if changed and on_rich:
-                        on_rich(item)
+                    held = rich.scan()
                 except Exception as e:
-                    changed, item = False, None
+                    held = False
                     print("clipboard: %s" % e)
-                if item is not None:                   # an image or a file: not text
-                    self.resync()
+                if held:                               # an image or a file is on it: not text
                     continue
             with self.lock:
                 cur = self._read()
                 if not cur or cur == self.last or len(cur) > CLIP_MAX:
                     continue
                 self.last = cur
+            if rich is not None:
+                rich.local_at = time.monotonic()
             on_change(cur)
 
 
@@ -362,7 +374,8 @@ class BlobRx:
             if kind not in ("image", "file") or not isinstance(size, int) or not 0 < size <= self.max:
                 raise ValueError("kind or size not allowed")
             self.cur = {"id": str(m.get("id"))[:32], "kind": kind, "name": safe_name(m.get("name")),
-                        "size": size, "sha": str(m.get("sha")), "parts": [], "got": 0}
+                        "size": size, "sha": str(m.get("sha")), "parts": [], "got": 0,
+                        "t0": time.monotonic()}
         elif t == "bdata" and self.cur and m.get("id") == self.cur["id"]:
             d = base64.b64decode(str(m.get("d", "")), validate=True)
             self.cur["got"] += len(d)
@@ -375,7 +388,8 @@ class BlobRx:
             data = b"".join(c["parts"])
             if len(data) != c["size"] or hashlib.sha256(data).hexdigest() != c["sha"]:
                 raise ValueError("size or checksum mismatch")
-            return {"id": c["id"], "kind": c["kind"], "name": c["name"], "data": data, "sha": c["sha"]}
+            return {"id": c["id"], "kind": c["kind"], "name": c["name"], "data": data, "sha": c["sha"],
+                    "t0": c["t0"]}
         return None
 
 
@@ -409,6 +423,21 @@ def png_to_dib(png):
         return out.getvalue()[14:]                       # drop the 14-byte file header
     except Exception:
         return None
+
+
+class ClipboardBusy(OSError):
+    """Another program has the clipboard open right now. Try again shortly."""
+
+
+def blob_label(blob):
+    return "an image" if blob["kind"] == "image" else blob["name"]
+
+
+def just_a_link(text):
+    """A browser's 'copy image' also puts the picture's address on the clipboard as text."""
+    t = str(text or "").strip()
+    return 0 < len(t) < 4096 and not any(ch.isspace() for ch in t) \
+        and t.lower().startswith(("http://", "https://", "file://", "data:"))
 
 
 def pack_dropfiles(path):
@@ -507,7 +536,7 @@ class WinRich:
     def read(self, maxbytes):
         """('file', path) | ('image', png bytes) | None."""
         if not self._open():
-            return None
+            raise ClipboardBusy("the Windows clipboard is busy")
         path = png = dib = None
         try:
             if self.u.IsClipboardFormatAvailable(self.CF_HDROP):
@@ -595,7 +624,8 @@ class MacRich:
             [self.F.NSURL], {self.A.NSPasteboardURLReadingFileURLsOnlyKey: True})
         if urls:
             return ("file", str(urls[0].path())) if len(urls) == 1 else None
-        if pb.stringForType_("public.utf8-plain-text"):
+        text = pb.stringForType_("public.utf8-plain-text")
+        if text and not just_a_link(text):
             return None                                   # text wins
         d = pb.dataForType_("public.png")
         if d is None:
@@ -641,21 +671,40 @@ def rich_backend():
 class RichClip:
     """Watches this computer's clipboard for an image or a single file, and puts
     received ones onto it. Everything here fails soft: a clipboard problem must
-    never disturb the keyboard and mouse."""
+    never disturb the keyboard and mouse.
 
-    def __init__(self, cfg, backend="auto"):
+    It remembers the checksum of the last item it sent or received, so reading
+    that same item back off the clipboard is never mistaken for a new copy."""
+
+    def __init__(self, cfg, backend="auto", clip=None):
         try:
             self.max = int(float(cfg.get("clip_max_mb", 50)) * 1_000_000)
         except (TypeError, ValueError):
             self.max = 50_000_000
         self.b = rich_backend() if backend == "auto" else backend
+        self.clip = clip                 # the text clipboard, told to stand down for images and files
+        self.on_change = None            # called with a new blob, or None when it is no longer one
+        self.known = None                # checksum of the last item sent or received
+        self.holding = False             # the clipboard holds an image or file right now
+        self.local_at = 0.0              # when something was last copied on this computer
         self.lock = threading.Lock()
+        if clip is not None:
+            clip.rich = self
         self.dir = os.path.join(config_dir(), "clipboard")
         self.last = self._seq()
+        self._tidy(0, 86400)
+
+    def _tidy(self, keep, older_than=0):
+        """Remove received files, except the newest `keep` and anything newer than `older_than` seconds."""
         try:
-            for f in os.listdir(self.dir):                # received files older than a day
-                p = os.path.join(self.dir, f)
-                if os.path.isfile(p) and time.time() - os.path.getmtime(p) > 86400:
+            items = [os.path.join(self.dir, f) for f in os.listdir(self.dir)]
+            items.sort(key=os.path.getmtime)
+            for p in items[:max(0, len(items) - keep)]:
+                if time.time() - os.path.getmtime(p) < older_than:
+                    continue
+                if os.path.isdir(p) and not os.path.islink(p):
+                    shutil.rmtree(p, ignore_errors=True)
+                else:
                     os.remove(p)
         except OSError:
             pass
@@ -666,52 +715,100 @@ class RichClip:
         except Exception:
             return None
 
+    def _read_blob(self):
+        """A blob, or None. Sets self.holding."""
+        item = self.b.read(self.max)
+        if not item:
+            self.holding = False
+            return None
+        kind, val = item
+        self.holding = True
+        if kind == "file":
+            if not os.path.isfile(val):
+                self.holding = False                  # a folder
+                return None
+            size = os.path.getsize(val)
+            if not 0 < size <= self.max:
+                print("clipboard: %s is %.0f MB, over the %d MB limit - not sent"
+                      % (os.path.basename(val), size / 1e6, self.max // 1_000_000))
+                return None
+            with open(val, "rb") as f:
+                return make_blob("file", os.path.basename(val), f.read())
+        if not 0 < len(val) <= self.max:
+            print("clipboard: image is over the %d MB limit - not sent" % (self.max // 1_000_000))
+            return None
+        return make_blob("image", "image.png", val)
+
     def poll(self):
-        """(changed, blob). blob is None when the clipboard holds something else."""
+        """(changed, blob). blob is None when there is nothing new to send."""
         if not self.b:
             return False, None
         with self.lock:
             s = self._seq()
             if s is None or s == self.last:
                 return False, None
-            self.last = s
+            prev, self.last = self.last, s
             try:
-                item = self.b.read(self.max)
-                if not item:
-                    return True, None
-                kind, val = item
-                if kind == "file":
-                    if not os.path.isfile(val):
-                        return True, None                 # a folder
-                    size = os.path.getsize(val)
-                    if not 0 < size <= self.max:
-                        print("clipboard: %s is %.0f MB, over the %d MB limit - not sent"
-                              % (os.path.basename(val), size / 1e6, self.max // 1_000_000))
-                        return True, None
-                    with open(val, "rb") as f:
-                        return True, make_blob("file", os.path.basename(val), f.read())
-                if not 0 < len(val) <= self.max:
-                    print("clipboard: image is over the %d MB limit - not sent" % (self.max // 1_000_000))
-                    return True, None
-                return True, make_blob("image", "image.png", val)
+                blob = self._read_blob()
+            except ClipboardBusy:
+                self.last = prev                          # look again on the next pass
+                return False, None
             except Exception as e:
+                self.holding = False
                 print("clipboard: could not read image or file (%s)" % e)
                 return True, None
+            if blob is None:
+                self.known = None
+                return True, None
+            if blob["sha"] == self.known:                 # our own item read back: not a new copy
+                return False, None
+            self.known = blob["sha"]
+            self.local_at = time.monotonic()
+            return True, blob
+
+    def took_text(self):
+        """Text from another computer was just put on this clipboard: not a local copy."""
+        with self.lock:
+            self.last, self.known, self.holding = self._seq(), None, False
+
+    def newer_here(self, since):
+        """True when something was copied on this computer after `since`, so an item
+        that was already on its way must not replace it."""
+        changed, blob = self.poll()
+        if changed and (blob is not None or (self.clip is not None and self.clip.unsent())):
+            if self.on_change:
+                self.on_change(blob)
+            return True
+        if self.clip is not None and self.clip.unsent():
+            return True
+        return since is not None and self.local_at > since
+
+    def scan(self):
+        """Look at the clipboard now and report any new image or file.
+        True when the clipboard holds an image or file (so it is not text)."""
+        changed, blob = self.poll()
+        if changed and self.on_change:
+            self.on_change(blob)
+        if self.holding and self.clip is not None:
+            self.clip.resync()
+        return self.holding
 
     def apply(self, blob):
         """Put a received image or file on this computer's clipboard."""
         if not self.b:
             return False
+        ok = False
         with self.lock:
             try:
                 if blob["kind"] == "image":
                     self.b.write_image(blob["data"])
                 else:
-                    os.makedirs(self.dir, exist_ok=True)
-                    path = os.path.join(self.dir, safe_name(blob["name"]))
-                    with open(path + ".part", "wb") as f:
+                    self._tidy(3)
+                    folder = os.path.join(self.dir, secrets.token_hex(4))   # a fresh path every time:
+                    os.makedirs(folder)                   # nothing can hold it open or have it cached
+                    path = os.path.join(folder, safe_name(blob["name"]))
+                    with open(path, "wb") as f:
                         f.write(blob["data"])
-                    os.replace(path + ".part", path)
                     png = None
                     if os.path.splitext(path)[1].lower() in IMAGE_EXT and hasattr(self.b, "as_png"):
                         try:
@@ -723,15 +820,173 @@ class RichClip:
                     else:
                         self.b.write_file(path)
                 changed = self._seq() != self.last
+                self.known, self.holding, ok = blob["sha"], True, True
                 print("clipboard: received %s (%.1f MB) - %s"
-                      % ("an image" if blob["kind"] == "image" else blob["name"], len(blob["data"]) / 1e6,
+                      % (blob_label(blob), len(blob["data"]) / 1e6,
                          "ready to paste" if changed else "but this computer's clipboard did not change"))
-                return True
             except Exception as e:
-                print("clipboard: could not place image or file (%s)" % e)
-                return False
+                print("clipboard: could not place %s (%s)" % (blob_label(blob), e))
             finally:
                 self.last = self._seq()
+        if ok and self.clip is not None:
+            self.clip.resync()
+        return ok
+
+
+class RichHost:
+    """Host side. Keeps the newest image or file from any computer and hands it
+    to whichever computer the mouse is on."""
+
+    def __init__(self, rich, host_key, get_active):
+        self.rich, self.hk, self.get_active = rich, host_key, get_active
+        self.lock = threading.Lock()
+        self.blob, self.have = None, set()
+        self.xlinks = {}                                 # client key -> transfer link
+        self.q = queue.Queue()
+        rich.on_change = self.local_copy
+        threading.Thread(target=self._worker, daemon=True).start()
+
+    def local_copy(self, blob):
+        """The host's own clipboard changed (blob is None when it is no longer an image or file)."""
+        with self.lock:
+            if blob is None and self.hk not in self.have:
+                return                                   # an item from a client is still waiting
+            self.blob, self.have = blob, {self.hk}
+        if blob is not None:
+            print("clipboard: copied %s here" % blob_label(blob))
+            active = self.get_active()
+            if active is not None:                       # copied, and the mouse is already elsewhere
+                self.q.put(active)
+
+    def forget(self):
+        """Newer text was copied somewhere: the held image or file is out of date."""
+        with self.lock:
+            self.blob, self.have = None, set()
+
+    def switched(self, target):
+        """Called from the input hook: must not block."""
+        self.q.put(target)
+
+    def serve(self, key, name, link, msgs):
+        """Runs for the life of one client's transfer connection."""
+        self.xlinks[key] = link
+        if self.get_active() == key:
+            self.q.put(key)                              # the link is back: hand over anything waiting
+        rx = BlobRx(self.rich.max)
+        for m in msgs:
+            try:
+                blob = rx.feed(m)
+            except (ValueError, TypeError) as e:
+                print("clipboard: transfer from %s refused (%s)" % (name, e))
+                continue
+            if blob:
+                with self.lock:
+                    self.blob, self.have = blob, {key}
+                print("clipboard: got %s from %s" % (blob_label(blob), name))
+                active = self.get_active()
+                if active != key:                        # the mouse already left that computer
+                    self.q.put(active)
+        if self.xlinks.get(key) is link:
+            del self.xlinks[key]
+
+    def _worker(self):
+        while True:
+            target = self.q.get()
+            try:
+                self._deliver(target)
+            except Exception as e:
+                print("clipboard: %s" % e)
+
+    def _deliver(self, target):
+        if target is not None:
+            self.rich.scan()                             # catch a copy made a moment before crossing
+        key = target or self.hk
+        with self.lock:
+            blob = self.blob
+            if blob is None or key in self.have:
+                return
+            self.have.add(key)
+        if target is None:
+            if self.rich.newer_here(blob.get("t0")):
+                with self.lock:
+                    if self.blob is blob:
+                        self.blob, self.have = None, set()
+                print("clipboard: kept the newer copy made here")
+                return
+            self.rich.apply(blob)
+            return
+        xl = self.xlinks.get(target)
+        if xl is None or not xl.alive:
+            with self.lock:
+                self.have.discard(key)
+            return
+        send_blob(xl, blob)
+        print("clipboard: sent %s to %s" % (blob_label(blob), target))
+
+
+class RichPeer:
+    """Client side of the transfer connection. Keeps it up for as long as the
+    main connection lives, and re-opens it if it drops."""
+
+    def __init__(self, rich, connect):
+        self.rich, self.connect = rich, connect
+        self.link, self.closed, self.waiting = None, False, None
+        rich.on_change = self.copied
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def copied(self, blob):
+        if blob is None:
+            return
+        link = self.link
+        if link is not None and link.alive:
+            print("clipboard: copied %s here - sending" % blob_label(blob))
+            send_blob(link, blob)
+        else:
+            self.waiting = blob                          # goes out as soon as the link is back
+
+    def _run(self):
+        told = False
+        while not self.closed:
+            try:
+                link = self.connect()
+            except Exception as e:
+                if not told:
+                    told = True
+                    print("image and file paste is off for now (%s)" % e)
+                time.sleep(3)
+                continue
+            told, self.link = False, link
+            if self.closed:
+                break
+            blob, self.waiting = self.waiting, None
+            if blob is not None:
+                self.copied(blob)
+            rx = BlobRx(self.rich.max)
+            for m in link.messages():
+                try:
+                    blob = rx.feed(m)
+                except (ValueError, TypeError) as e:
+                    print("clipboard: transfer refused (%s)" % e)
+                    continue
+                if blob:
+                    try:
+                        if self.rich.newer_here(blob["t0"]):
+                            print("clipboard: kept the newer copy made here")
+                        else:
+                            self.rich.apply(blob)
+                    except Exception as e:
+                        print("clipboard: %s" % e)
+            if not self.closed:
+                time.sleep(2)
+        if self.link is not None:
+            self.link.close()
+
+    def close(self):
+        self.closed = True
+        if self.rich.on_change == self.copied:
+            self.rich.on_change = None
+        if self.link is not None:
+            self.link.close()
 
 
 # ==========================================================================
@@ -1170,49 +1425,10 @@ def run_host(cfg):
 
     # images and files: the host keeps the newest one and hands it to whichever
     # computer the mouse moves to next
-    rich = RichClip(cfg)
-    rlock = threading.Lock()
-    rstate = {"blob": None, "have": set()}
-    xlinks = {}                                      # client key -> transfer link
-    rq = queue.Queue()
-
-    def on_host_rich(item):
-        with rlock:
-            rstate["blob"], rstate["have"] = item, {hub.hk}
-        if item is not None and hub.active is not None:
-            rq.put(hub.active)                       # copied, then crossed before we noticed
-
-    def deliver(target):
-        key = target or hub.hk
-        with rlock:
-            blob = rstate["blob"]
-            if blob is None or key in rstate["have"]:
-                return
-            rstate["have"].add(key)
-        if target is None:
-            rich.apply(blob)
-            clip.resync()
-            return
-        xl = xlinks.get(target)
-        if xl is None or not xl.alive:
-            with rlock:
-                rstate["have"].discard(key)
-            return
-        send_blob(xl, blob)
-        print("clipboard: sent %s to %s" % ("an image" if blob["kind"] == "image" else blob["name"], target))
-
-    def rich_worker():
-        while True:
-            target = rq.get()
-            try:
-                deliver(target)
-            except Exception as e:
-                print("clipboard: %s" % e)
-
-    hub.on_switch = rq.put
-    threading.Thread(target=rich_worker, daemon=True).start()
-    threading.Thread(target=clip.watch, args=(lambda: True, on_host_clip, rich, on_host_rich),
-                     daemon=True).start()
+    rich = RichClip(cfg, clip=clip)
+    rhost = RichHost(rich, hub.hk, lambda: hub.active)
+    hub.on_switch = rhost.switched
+    threading.Thread(target=clip.watch, args=(lambda: True, on_host_clip, rich), daemon=True).start()
 
     gate = threading.BoundedSemaphore(MAX_HANDSHAKES)
     failures = {}                                    # ip -> [timestamps of bad attempts]
@@ -1257,23 +1473,7 @@ def run_host(cfg):
             return
         cname = clean_name(hello["name"])
         if hello.get("xfer"):                          # second connection: images and files only
-            xk = cname.lower()
-            xlinks[xk] = link
-            rx = BlobRx(rich.max)
-            for m in msgs:
-                try:
-                    blob = rx.feed(m)
-                except (ValueError, TypeError) as e:
-                    print("clipboard: transfer from %s refused (%s)" % (cname, e))
-                    continue
-                if blob:
-                    with rlock:
-                        rstate["blob"], rstate["have"] = blob, {xk}
-                    print("clipboard: got %s from %s" % ("an image" if blob["kind"] == "image" else blob["name"], cname))
-                    if hub.active != xk:               # the mouse already left that computer
-                        rq.put(hub.active)
-            if xlinks.get(xk) is link:
-                del xlinks[xk]
+            rhost.serve(cname.lower(), cname, link, msgs)
             return
         if hello.get("probe"):                         # pairing check from setup
             link.send(t="hello", host=name, os="win", version=VERSION)
@@ -1294,6 +1494,7 @@ def run_host(cfg):
                     text = m.get("text", "")
                     if isinstance(text, str) and text and len(text) <= CLIP_MAX:
                         clip.set(text)
+                        rhost.forget()
                         hub.broadcast(exclude=k, t="clip", text=text)
             except (TypeError, ValueError):
                 continue                               # malformed message: ignore
@@ -1404,7 +1605,7 @@ def run_client(host, cfg, name=None):
     speed = float(cfg.get("speed", 1.0))
     spx = float(cfg.get("scroll_pixels", 40))
     clip = Clip()
-    rich = RichClip(cfg)
+    rich = RichClip(cfg, clip=clip)
 
     def scroll(dx, dy):
         if mac:
@@ -1464,23 +1665,7 @@ def run_client(host, cfg, name=None):
         failures = 0
         link = Link(sock)
         link.send(t="hello", name=name, os="mac" if mac else sys.platform, version=VERSION)
-        st = {"active": False, "keys": set(), "btns": set(), "last_leave": 0.0, "xl": None}
-
-        def xfer_receive(xl):
-            rx = BlobRx(rich.max)
-            for xm in xl.messages():
-                try:
-                    blob = rx.feed(xm)
-                except (ValueError, TypeError) as e:
-                    print("clipboard: transfer refused (%s)" % e)
-                    continue
-                if blob and rich.apply(blob):
-                    clip.resync()
-
-        def send_rich(item):
-            xl = st["xl"]
-            if item is not None and xl is not None and xl.alive:
-                send_blob(xl, item)
+        st = {"active": False, "keys": set(), "btns": set(), "last_leave": 0.0, "peer": None}
         resolve = key_resolver(Key, False)
 
         def release_all():
@@ -1505,22 +1690,24 @@ def run_client(host, cfg, name=None):
                     resolve = key_resolver(Key, swap)
                     print("connected to host '%s'%s" % (msg.get("host"), "  (Ctrl -> Cmd)" if swap else ""))
                     if ver_tuple(msg.get("version", "0")) >= (0, 5, 0):
-                        try:                           # second connection for images and files
+                        def xfer_link(host=host):      # second connection for images and files
                             xl = Link(connect_tls(host, port, cfg["secret"]))
                             xl.send(t="hello", xfer=True, name=name, version=VERSION)
-                            st["xl"] = xl
-                            threading.Thread(target=xfer_receive, args=(xl,), daemon=True).start()
-                        except (OSError, PermissionError) as e:
-                            print("image and file paste is off for now (%s)" % e)
+                            return xl
+                        if st["peer"] is None:
+                            st["peer"] = RichPeer(rich, xfer_link)
                     threading.Thread(target=clip.watch, daemon=True, args=(
-                        lambda: link.alive, lambda text: link.send(t="clip", text=text),
-                        rich, send_rich)).start()
+                        lambda: link.alive, lambda text: link.send(t="clip", text=text), rich)).start()
                 elif t == "enter":
                     st["active"] = True
                     m.position = place(msg.get("edge"), msg.get("pos", 0.5))
                 elif t == "exit":
                     st["active"] = False
                     release_all()
+                    try:
+                        rich.scan()                    # a copy made a moment before the mouse left
+                    except Exception as e:
+                        print("clipboard: %s" % e)
                 elif t == "m" and st["active"]:
                     px, py = m.position
                     tx, ty = px + msg["dx"] * speed, py + msg["dy"] * speed
@@ -1564,8 +1751,8 @@ def run_client(host, cfg, name=None):
                 continue                           # malformed message: ignore
 
         release_all()
-        if st["xl"] is not None:
-            st["xl"].close()
+        if st["peer"] is not None:
+            st["peer"].close()
         print("disconnected, reconnecting...")
         time.sleep(2)
 

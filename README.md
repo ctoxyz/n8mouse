@@ -106,7 +106,7 @@ Found a security problem? See [SECURITY.md](SECURITY.md).
 
 - Copy and paste carries text, images, and one file at a time, up to 50 MB
   (`clip_max_mb` in `n8mouse.json`). For a folder or several files, zip them first.
-- Received files are kept in a `clipboard` folder next to `n8mouse.json` for a day.
+- Received files are kept in a `clipboard` folder next to `n8mouse.json`: the newest few, for up to a day.
 - Each computer counts as one screen, however many monitors it has.
 - The host must be Windows for now.
 - The Mac download is for Apple Silicon.
