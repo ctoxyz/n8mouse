@@ -132,6 +132,8 @@ Logs: `n8mouse.log` next to `n8mouse.json`.
 - Another program or user on the same computer can stop n8Mouse+. They cannot control it.
 - The wrong-code lockout has been reviewed in the code but not attack-tested.
 - Image and file paste is new in v0.5 and has been tested on one Windows PC and one Mac.
+- Some apps keep their own clipboard and miss a new picture (Photoshop does). Click another
+  window, click back, then paste.
 - The Mac app is early and unsigned. After an update, macOS may need its Accessibility
   switch turned off and on again.
 - Guessing a pairing code on a 192-core server would take about a trillion years (a rough
